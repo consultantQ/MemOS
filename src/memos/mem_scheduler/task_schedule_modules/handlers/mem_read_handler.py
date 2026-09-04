@@ -6,7 +6,7 @@ import json
 import traceback
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from memos.context.context import ContextThreadPoolExecutor
 from memos.log import get_logger
@@ -96,6 +96,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                 info=info,
                 chat_history=chat_history,
                 user_context=user_context,
+                operation_context=message,
             )
 
             logger.info(
@@ -119,6 +120,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
         info: dict | None = None,
         chat_history: list | None = None,
         user_context: UserContext | None = None,
+        operation_context: Any | None = None,
     ) -> None:
         logger.info(
             "[DIAGNOSTIC] mem_read_handler._process_memories_with_reader called. mem_ids: %s, user_id: %s, mem_cube_id: %s, task_id: %s",
@@ -127,6 +129,12 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             mem_cube_id,
             task_id,
         )
+        operation_context = operation_context or {
+            "task_id": task_id,
+            "label": MEM_READ_TASK_LABEL,
+            "user_id": user_id,
+            "cube_id": mem_cube_id,
+        }
         kb_log_content: list[dict] = []
         try:
             mem_reader = self.scheduler_context.get_mem_reader()
@@ -169,15 +177,26 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             is_upload_skill = info.pop("is_upload_skill", False)
 
             try:
-                processed_memories = mem_reader.fine_transfer_simple_mem(
-                    memory_items,
-                    type="chat",
-                    custom_tags=custom_tags,
-                    user_name=user_name,
-                    chat_history=chat_history,
-                    user_context=user_context,
-                    is_upload_skill=is_upload_skill,
-                )
+                with self.observe_operation(
+                    "fine_transfer_simple_mem",
+                    operation="fine",
+                    target="textual_memory",
+                    operation_context=operation_context,
+                    operation_input={"memories": memory_items, "type": "chat"},
+                    capture_failure=True,
+                ) as observation:
+                    observation.result(
+                        mem_reader.fine_transfer_simple_mem(
+                            memory_items,
+                            type="chat",
+                            custom_tags=custom_tags,
+                            user_name=user_name,
+                            chat_history=chat_history,
+                            user_context=user_context,
+                            is_upload_skill=is_upload_skill,
+                        )
+                    )
+                processed_memories = observation.value
             except Exception as e:
                 logger.warning("%s: Fail to transfer mem: %s", e, memory_items)
                 processed_memories = []
@@ -195,7 +214,16 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                         for memory in flattened_memories
                         if memory.metadata.memory_type != "RawFileMemory"
                     ]
-                    enhanced_mem_ids = text_mem.add(mem_group, user_name=user_name)
+                    with self.observe_operation(
+                        "add_enhanced_memories",
+                        operation="add",
+                        target="textual_memory",
+                        operation_context=operation_context,
+                        operation_input={"memories": mem_group, "user_name": user_name},
+                        capture_failure=True,
+                    ) as observation:
+                        observation.result(text_mem.add(mem_group, user_name=user_name))
+                    enhanced_mem_ids = observation.value
                     logger.info(
                         "Added %s enhanced memories: %s",
                         len(enhanced_mem_ids),
@@ -244,11 +272,21 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                                     )
                                     for old_id in old_ids:
                                         try:
-                                            mem_reader.graph_db.update_node(
-                                                str(old_id),
-                                                {"status": "archived"},
-                                                user_name=user_name,
-                                            )
+                                            with self.observe_operation(
+                                                "archive_merged_memories",
+                                                operation="archive",
+                                                target="textual_memory",
+                                                operation_context=operation_context,
+                                                operation_input={"memory_ids": [str(old_id)]},
+                                                capture_failure=True,
+                                            ) as observation:
+                                                observation.result(
+                                                    mem_reader.graph_db.update_node(
+                                                        str(old_id),
+                                                        {"status": "archived"},
+                                                        user_name=user_name,
+                                                    )
+                                                )
                                             logger.info(
                                                 "[Scheduler] Archived merged_from memory: %s",
                                                 old_id,
@@ -405,7 +443,15 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             if delete_ids:
                 try:
                     if getattr(mem_reader, "memory_version_switch", "off") != "on":
-                        text_mem.delete(delete_ids, user_name=user_name)
+                        with self.observe_operation(
+                            "remove_memories",
+                            operation="delete",
+                            target="textual_memory",
+                            operation_context=operation_context,
+                            operation_input={"memory_ids": delete_ids},
+                            capture_failure=True,
+                        ) as observation:
+                            observation.result(text_mem.delete(delete_ids, user_name=user_name))
                         logger.info(
                             "Delete raw/working mem_ids: %s for user_name: %s",
                             delete_ids,
@@ -418,15 +464,29 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                             for memory_list in processed_memories:
                                 flattened_memories.extend(memory_list)
                         allowed_types = ["UserMemory", "LongTermMemory"]
-                        text_mem.soft_delete(
-                            delete_ids,
-                            user_name,
-                            [
-                                mem.id
-                                for mem in flattened_memories
-                                if mem.metadata.memory_type in allowed_types
-                            ],
-                        )
+                        preserved_memory_ids = [
+                            mem.id
+                            for mem in flattened_memories
+                            if mem.metadata.memory_type in allowed_types
+                        ]
+                        with self.observe_operation(
+                            "remove_memories",
+                            operation="soft_delete",
+                            target="textual_memory",
+                            operation_context=operation_context,
+                            operation_input={
+                                "memory_ids": delete_ids,
+                                "preserved_memory_ids": preserved_memory_ids,
+                            },
+                            capture_failure=True,
+                        ) as observation:
+                            observation.result(
+                                text_mem.soft_delete(
+                                    delete_ids,
+                                    user_name,
+                                    preserved_memory_ids,
+                                )
+                            )
                         logger.info(
                             "Soft delete raw/working mem_ids: %s for user_name: %s",
                             delete_ids,
