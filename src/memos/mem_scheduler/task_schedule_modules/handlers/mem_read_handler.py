@@ -182,7 +182,11 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                     operation="fine",
                     target="textual_memory",
                     operation_context=operation_context,
-                    operation_input={"memories": memory_items, "type": "chat"},
+                    operation_input={
+                        "memories": memory_items,
+                        "type": "chat",
+                        "result_grouping": self._fine_transfer_result_grouping(mem_reader),
+                    },
                     capture_failure=True,
                 ) as observation:
                     observation.result(
@@ -574,3 +578,18 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             )
         except Exception as e:
             logger.error("Failed to enqueue MEM_ORGANIZE task: %s", e, exc_info=True)
+
+    def _fine_transfer_result_grouping(self, mem_reader: Any) -> str:
+        """Describe known transfer implementations at the observation boundary."""
+
+        from memos.mem_reader.multi_modal_struct import MultiModalStructMemReader
+        from memos.mem_reader.simple_struct import SimpleStructMemReader
+
+        # Match the bound implementation so inherited methods work, while overrides
+        # with a different grouping contract remain unknown unless explicitly declared.
+        transfer = getattr(mem_reader.fine_transfer_simple_mem, "__func__", None)
+        if transfer is MultiModalStructMemReader.fine_transfer_simple_mem:
+            return "batch"
+        if transfer is SimpleStructMemReader.fine_transfer_simple_mem:
+            return "per_input"
+        return "unknown"

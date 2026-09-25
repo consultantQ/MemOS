@@ -815,7 +815,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         if not input_memories:
             return []
 
-        memory_list = []
+        memory_list = [[] for _ in input_memories]
 
         if type == "chat":
             processing_func = self._process_transfer_chat_data
@@ -826,15 +826,15 @@ class SimpleStructMemReader(BaseMemReader, ABC):
 
         # Process Q&A pairs concurrently with context propagation
         with ContextThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(processing_func, scene_data_info, custom_tags, **kwargs)
-                for scene_data_info in input_memories
-            ]
+            futures = {
+                executor.submit(processing_func, scene_data_info, custom_tags, **kwargs): index
+                for index, scene_data_info in enumerate(input_memories)
+            }
             for future in concurrent.futures.as_completed(futures):
                 try:
                     res_memory = future.result()
                     if res_memory is not None:
-                        memory_list.append(res_memory)
+                        memory_list[futures[future]] = res_memory
                 except Exception as e:
                     logger.error(f"Task failed with exception: {e}")
                     logger.error(traceback.format_exc())
