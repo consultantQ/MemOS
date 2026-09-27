@@ -1,8 +1,4 @@
-"""添加链路及其后台 MemRead 增强处理。
-
-消息 -> 提取记忆 -> 持久化记忆 -> 增强记忆 -> 持久化记忆。
-先列出 Hook 回调, 再列出消息批次关联、节点构造和来源配对函数。
-"""
+"""Capture message extraction, persistence, and background MemRead flows."""
 
 from __future__ import annotations
 
@@ -32,14 +28,13 @@ if TYPE_CHECKING:
 _MEM_READ_SOURCE_PREFIX = "scheduler.mem_read."
 
 
-# 仅在明确只有一个 cube 时给出默认值, 多 cube 场景不猜测某条记忆的归属.
+# Only infer a cube when ownership is unambiguous.
 def _single_cube_id(subject: Any) -> str | None:
     cube_ids = _cube_ids(subject)
     return cube_ids[0] if len(cube_ids) == 1 else None
 
 
-# 递归展开各种嵌套返回结构, 产出 (记忆对象, cube_id, memory_id).
-# 仅接受同时具有 ID 和正文的记录; 遍历时沿用外层 cube, 并跳过元数据包装字段.
+# Walk ID-bearing memory records, carrying cube ownership through wrappers.
 def _walk_memory_records(
     value: Any, cube_id: str | None = None
 ) -> Iterator[tuple[Any, str | None, str]]:
@@ -61,7 +56,6 @@ def _walk_memory_records(
             yield from _walk_memory_records(item, current_cube)
 
 
-# 保存一次 add 的消息身份及尚未完成提取的 cube, 供后续 MemReader 回调接续同一输入节点.
 @dataclass(slots=True)
 class _MessageBatch:
     owner: Callable[[], Any]
@@ -91,7 +85,6 @@ class AddHandler(BaseHandler):
         with self._message_batches_lock:
             self._message_batches.clear()
 
-    # 添加链路入口: 仅跟踪非反馈且非空的消息批次, 首次创建图的根输入节点.
     def on_add_before(self, *, request: Any, **_kwargs: Any) -> None:
         if bool(_get(request, "is_feedback", False)):
             return
@@ -117,14 +110,12 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # add 结束后的兜底清理, 覆盖跳过 MemReader 等未消费批次关联的路径.
     def on_add_after(self, *, request: Any, **_kwargs: Any) -> None:
         """Clear pending batches if the add path did not invoke MemReader."""
         key = self._message_batch_key(request, _get(request, "messages"))
         with self._message_batches_lock:
             self._message_batches.pop(key, None)
 
-    # 只处理 chat 场景, 将同一消息批次连向每条提取出的记忆; 不记录 Reader 内部变量.
     def on_mem_reader_extract_after(
         self,
         *,
@@ -161,7 +152,7 @@ class AddHandler(BaseHandler):
             )
             for memory, cube_id, memory_id in _walk_memory_records(result, default_cube_id)
         )
-        # 消息关联已在构造 message 时消费, 因此空提取结果也不会遗留这次 cube 的待处理状态.
+        # Consume the cube's message reference even when extraction produces no output.
         if message is None or not extracted:
             return
 
@@ -180,7 +171,6 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # chat 提取失败时消费消息批次关联并连向失败状态, 只保留异常类型.
     def on_mem_reader_extract_failed(
         self,
         *,
@@ -221,8 +211,7 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # 根据写入成功 Hook 的返回 ID 建立 extracted_memory -> persisted_memory.
-    # 这是对 Hook 通知的观测; 能否反映真实写入结果依赖 MemOS 正确传播数据库异常.
+    # A successful Hook observes the method boundary, not an independent database check.
     def on_text_memory_add_after(
         self,
         *,
@@ -257,8 +246,7 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # 写入失败 Hook 将候选记忆连到失败状态, 不依据输入数量推断成功落库节点.
-    # 失败描述本次操作结果; 如果底层有部分写入已提交, 这里不表示那些写入被回滚.
+    # Failure does not imply rollback of writes already committed.
     def on_text_memory_add_failed(
         self,
         *,
@@ -296,7 +284,6 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # 转发成功操作及 Hook 已提供的 result, 不重新调用调度器业务方法.
     def on_scheduler_memory_operation_after(
         self,
         *,
@@ -315,7 +302,6 @@ class AddHandler(BaseHandler):
             status="after",
         )
 
-    # 转发失败观测, 让输入连向失败状态; 原始异常的继续传播由 MemOS 调用方处理.
     def on_scheduler_memory_operation_failed(
         self,
         *,
@@ -334,12 +320,10 @@ class AddHandler(BaseHandler):
             status="failed",
         )
 
-    # Python 对象地址只用于短期查找同一消息批次, 不直接作为图中永久身份.
     @staticmethod
     def _message_batch_key(subject: Any, messages: Any) -> tuple[str, str | None, int]:
         return _current_trace_id(subject), _get(subject, "user_id"), id(messages)
 
-    # reference=False 表示新 add, 分配新 UUID; True 表示提取回调, 尝试消费已有批次关联.
     def _message_identity(self, subject: Any, messages: Any, *, reference: bool) -> str:
         key = self._message_batch_key(subject, messages)
         with self._message_batches_lock:
@@ -349,19 +333,18 @@ class AddHandler(BaseHandler):
                 # subsequently allocated list at the same address.
                 if batch is not None and _get(batch.owner(), "messages") is messages:
                     cubes = _cube_ids(subject)
-                    # 一个 add 可向多个 cube 提取; 等各 cube 都消费完关联后才移除, 避免后续 cube 丢失输入身份.
+                    # Keep the batch until every target cube has consumed its reference.
                     batch.pending_cubes.difference_update(cubes)
                     if not cubes or not batch.pending_cubes:
                         del self._message_batches[key]
                     return batch.identity
                 self._message_batches.pop(key, None)
-            # 每次新 add 使用新 UUID, 即使调用方重复使用同一个 messages 列表也不会复用上次节点.
-            # 引用未命中时也生成独立身份, 不把来源不明的提取结果误接到其他请求.
+            # Each add gets a fresh identity; unmatched references never borrow another request's.
             identity = f"message_batch:{key[0]}:{uuid4().hex}"
             if not reference:
                 owner: Callable[[], Any]
                 try:
-                    # 弱引用允许已丢弃请求被回收; 查询时还会验证其 messages 就是当前对象, 防止地址复用误配.
+                    # Do not keep abandoned requests alive.
                     owner = weakref.ref(subject)
                 except TypeError:
                     # Plain dict/namespace callers cannot be weakly referenced.
@@ -372,12 +355,12 @@ class AddHandler(BaseHandler):
                 cubes = set(_cube_ids(subject)) or {str(_get(subject, "user_id", "unknown"))}
                 self._message_batches[key] = _MessageBatch(owner, identity, cubes)
                 self._message_batches.move_to_end(key)
-                # 异常退出或缺少后续 Hook 时也受数量上限约束; 最旧的待处理关联会被淘汰.
+                # Bound pending batches even if no completion Hook arrives.
                 while len(self._message_batches) > self._max_pending_adds:
                     self._message_batches.popitem(last=False)
             return identity
 
-    # 兼容 Reader 的单组包装 [messages], 解包后尽可能保留原消息对象以关联 add 节点.
+    # Unwrap a single scene without copying the messages used for correlation.
     @staticmethod
     def _messages_from_scene_data(scene_data: Any) -> Any:
         if isinstance(scene_data, list | tuple) and len(scene_data) == 1:
@@ -386,7 +369,6 @@ class AddHandler(BaseHandler):
                 return messages
         return scene_data
 
-    # 消息批次在 add.before 创建, 在 MemReader 回调中以 identity_only 引用同一节点.
     def _message_value(
         self,
         subject: Any,
@@ -406,7 +388,6 @@ class AddHandler(BaseHandler):
             metadata=metadata,
         )
 
-    # 提取结果属于当前 trace 和 cube; 身份带 extracted_memory 前缀, 让后续落库转换可见.
     def _extracted_memory_value(
         self,
         subject: Any,
@@ -429,8 +410,7 @@ class AddHandler(BaseHandler):
             metadata=metadata,
         )
 
-    # 按 cube + memory_id 建立持久化锚点; 返回 ID 无法匹配输入时只记录 ID 占位.
-    # 身份不含 trace, 使同一图中的同步写入和延迟调度可以接到同一节点; 不会跨图合并.
+    # Share persisted anchors within a graph, including references arriving before the write.
     def _persisted_memory_value(
         self,
         memory: Any,
@@ -462,7 +442,6 @@ class AddHandler(BaseHandler):
             },
         )
 
-    # 后台操作按数据库身份引用原记忆; 即使写入事件尚未到达, 也可先建立占位与连线.
     def _persisted_memory_reference(
         self,
         *,
@@ -480,7 +459,6 @@ class AddHandler(BaseHandler):
             metadata={"cube_id": cube_id, "memory_id": memory_id},
         )
 
-    # 精细处理结果先使用 enhanced_memory 身份, 写库时引用它, 再连向新的持久化锚点.
     def _enhanced_memory_value(
         self,
         subject: Any,
@@ -506,7 +484,6 @@ class AddHandler(BaseHandler):
             metadata={"cube_id": cube_id, "memory_id": memory_id},
         )
 
-    # 归档、删除、刷新或失败等没有记忆输出的操作, 使用带操作身份的字符串结果作为终点.
     def _scheduler_result_value(
         self,
         hook_context: HookContext,
@@ -531,7 +508,6 @@ class AddHandler(BaseHandler):
             },
         )
 
-    # 把已落库输入与精细处理输出关联; 连线方式依赖 Hook 显式声明的结果分组契约.
     def _fine_transfer_values(
         self,
         subject: Any,
@@ -547,16 +523,16 @@ class AddHandler(BaseHandler):
         links: list[TraceLink] = []
         grouping = operation_input.get("result_grouping", "unknown")
         result_groups = result if isinstance(result, list | tuple) else []
-        # per_input 的外层结果按输入顺序一一分组, 空组也必须保留, 否则会把后续结果接错来源.
+        # Empty groups preserve alignment with their corresponding input.
         if grouping == "per_input" and len(result_groups) == len(inputs):
             groups = [
-                (inputs[index : index + 1], group) for index, group in enumerate(result_groups)
+                ([source], group) for source, group in zip(inputs, result_groups, strict=True)
             ]
-        # batch 明确声明整批输入共同产生输出; 只有一个输入时也能确定所有输出的来源.
+        # Batch grouping (or one source) gives every output all known inputs.
         elif grouping == "batch" or len(inputs) == 1:
             groups = [(inputs, result)]
         else:
-            # 多输入而分组未知或数量不一致时保留输出, 使用空来源列表, 后续元数据标记 unresolved.
+            # Keep unresolved outputs without guessing source edges.
             groups = [([], result)]
 
         for source_values, group in groups:
@@ -580,7 +556,6 @@ class AddHandler(BaseHandler):
                 )
         return inputs, outputs, links
 
-    # 同步写入与增强写入共用配对规则: 用返回 ID 匹配唯一输入, 不按返回顺序猜测来源.
     def _persistence_values(
         self,
         subject: Any,
@@ -595,7 +570,7 @@ class AddHandler(BaseHandler):
         inputs: list[TraceValue] = []
         outputs: list[TraceValue] = []
         links: list[TraceLink] = []
-        # 索引保留每个 ID 对应的所有输入位置, 用于识别重复 ID 引起的歧义.
+        # Only a unique input ID establishes lineage, regardless of returned ID order.
         candidates: dict[str, list[int]] = defaultdict(list)
         source_value = self._enhanced_memory_value if enhanced else self._extracted_memory_value
         for source_index, (memory, record_cube, candidate_id) in enumerate(records):
@@ -618,7 +593,6 @@ class AddHandler(BaseHandler):
         for index, result_id in enumerate(result_ids):
             memory_id = str(result_id)
             matching = candidates.get(memory_id, [])
-            # 返回 ID 可能乱序、跳过部分输入或没有已知来源; 只有唯一匹配才继承正文并建立连线.
             source_index = matching[0] if len(matching) == 1 else None
             memory, record_cube, _ = (
                 records[source_index] if source_index is not None else (None, cube_id, memory_id)
@@ -642,15 +616,13 @@ class AddHandler(BaseHandler):
                 )
         return inputs, outputs, links
 
-    # 来源关系完整为 resolved, 部分可确认是 partial, 有输出但无连线是 unresolved.
-    # 没有输出也没有连线时视为 resolved, 因为不存在需要解释来源的输出.
+    # No outputs means there is no unresolved lineage.
     @staticmethod
     def _persistence_lineage(outputs: list[TraceValue], links: list[TraceLink]) -> str:
         if len(links) == len(outputs):
             return "resolved"
         return "partial" if links else "unresolved"
 
-    # 精细处理从完整 memories 提取 ID; 其他操作从 memory_ids 引用持久化节点.
     def _scheduler_persisted_inputs(
         self,
         operation_name: str,
@@ -673,8 +645,6 @@ class AddHandler(BaseHandler):
             for memory_id in memory_ids
         ]
 
-    # MemRead 成功/失败事件的共同入口; 根据操作类型构造输入输出与数据依赖.
-    # 后台任务的执行先后不自动产生边, 只有实际消费的记忆才连向输出或状态节点.
     def _on_scheduler_memory_operation(
         self,
         *,
@@ -687,7 +657,7 @@ class AddHandler(BaseHandler):
         status: str,
     ) -> None:
         source = str(_get(hook_context, "source", ""))
-        # 通用调度 Hook 也会承载其他 handler 的操作; 本插件这里只解释 MemRead 的业务契约.
+        # Other handlers share this Hook; only interpret MemRead operations.
         if not source.startswith(_MEM_READ_SOURCE_PREFIX):
             return
 
@@ -715,6 +685,7 @@ class AddHandler(BaseHandler):
                 cube_id=cube_id,
                 enhanced=True,
             )
+            lineage = self._persistence_lineage(outputs, links)
         else:
             inputs = self._scheduler_persisted_inputs(
                 operation_name,
@@ -722,21 +693,16 @@ class AddHandler(BaseHandler):
                 cube_id=cube_id,
             )
 
-        # 归档/删除/刷新或失败时通常没有记忆输出; 用状态节点承接每条实际输入, 保持操作可见.
+        # Operations without memory outputs still have an observable status.
         if not outputs:
             if status == "failed":
                 category = "scheduler_operation_failed"
                 comment = "The MemRead scheduler operation failed while processing this memory."
-            elif operation_name in {
-                "archive_merged_memories",
-                "remove_memories",
-                "remove_source_memories",
-            }:
-                category = (
-                    "memory_archival"
-                    if operation_name == "archive_merged_memories"
-                    else "memory_deletion"
-                )
+            elif operation_name == "archive_merged_memories":
+                category = "memory_archival"
+                comment = f"Apply {operation_name} to a persisted memory unit."
+            elif operation_name in {"remove_memories", "remove_source_memories"}:
+                category = "memory_deletion"
                 comment = f"Apply {operation_name} to a persisted memory unit."
             else:
                 category = "scheduler_operation_result"
@@ -770,12 +736,9 @@ class AddHandler(BaseHandler):
             if status == "after" and any(value.category == "enhanced_memory" for value in outputs):
                 metadata["lineage_status"] = "resolved" if links else "unresolved"
         elif operation_name == "add_enhanced_memories" and status == "after":
-            metadata["lineage_status"] = self._persistence_lineage(
-                [value for value in outputs if value.category == "persisted_memory"],
-                [link for link in links if link.category == "memory_persistence"],
-            )
+            metadata["lineage_status"] = lineage
         if status == "failed":
-            # 异常消息可能包含业务正文或后端细节, 图中只记录异常类名, 不保存错误对象或消息.
+            # Record only the exception type; messages can expose business data.
             metadata["error_type"] = type(error).__name__
         self._emit(
             self._event(

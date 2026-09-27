@@ -119,20 +119,21 @@ The synchronous add flow emits three semantic memory categories:
 - `message_batch`: messages received at `add.before` and consumed by
   `mem_reader.extract.after`;
 - `extracted_memory`: a MemReader output passed into the TextMemory writer;
-- `persisted_memory`: the memory after `text_memory.add.after` confirms the write.
+- `persisted_memory`: the memory observed when `text_memory.add.after` returns its ID.
 
 The asynchronous MemRead scheduler also emits:
 
 - `enhanced_memory`: a fine-transfer result reused as the input to the enhanced-memory
   database write;
-- `scheduler_result`: a string result for operations such as archive, delete, refresh,
+- `scheduler_result`: a string result for operations such as archive, delete,
   or failure that do not otherwise expose a graphable output value.
 
 Scheduler fine-transfer inputs reuse the `memory:<cube_id>:<memory_id>` identity created
 by the earlier TextMemory persistence event. This connects the original persisted memory
 to its enhanced successor without creating a duplicate memory node. Archive, delete,
-refresh, and failed MemRead operations are also recorded; failures include only the error
-type, not the error message or an error-value node.
+soft-delete, and failed MemRead operations are also recorded; failures include only the
+error type, not the error message or an error-value node. The current MemRead refresh
+call is not wrapped by an operation Hook and is not recorded separately.
 
 A persisted memory unit is one immutable graph anchor per cube and memory ID. Its first
 complete snapshot is retained; different later observations log a warning without replacing
@@ -146,8 +147,8 @@ one group per input in input order, including empty groups for failures; `batch`
 means the whole input batch contributes to its outputs. The MemRead scheduler Hook
 identifies SimpleStructMemReader's transfer implementation (including inherited uses
 such as StrategyStructMemReader) as `per_input`, and MultiModalStructMemReader's as
-`batch`. A Reader's explicit `fine_transfer_result_grouping` declaration takes
-precedence; custom transfer implementations otherwise remain `unknown`. If grouping is
+`batch`. Grouping is inferred from the bound transfer implementation; custom overrides
+remain `unknown`. If grouping is
 unknown or inconsistent for multiple inputs, the plugin preserves the nodes and
 marks lineage as unresolved instead of guessing source edges. Failed enhanced
 writes retain their enhanced-memory inputs and links to the failure status.
@@ -155,14 +156,15 @@ writes retain their enhanced-memory inputs and links to the failure status.
 The integration follows the current MemOS operation-boundary Hook contract: callbacks
 receive correlation-only `HookContext` data plus explicit business keyword arguments.
 Successful MemReader, TextMemory, and scheduler callbacks observe the piped `result`;
-their matching `failed` callbacks record a status node without changing the propagated
-exception. MemReader and TextMemory failures also omit exception messages.
+their matching `failed` callbacks record a status node without changing MemOS exception
+handling. MemReader and TextMemory failures also omit exception messages.
 
-Database write exceptions propagate through `MemoryManager.add`, including batch and
-parallel single-node writes. A failed add emits the existing failure Hook instead of a
-successful persistence event, and a failed enhanced write skips source-memory deletion
-for that MemRead operation. Some concurrent writes may already have committed; failure
-describes the operation outcome and does not imply rollback of those writes.
+A successful Hook means the observed method returned; the plugin does not independently
+verify database persistence. MemOS may catch and log lower-level write errors before
+they reach the Hook boundary, so a `persisted_memory` node alone is not proof of a
+successful database write. Failure Hooks only observe exceptions reaching their boundary.
+If an enhanced-write exception reaches that boundary, subsequent source-memory deletion
+is skipped for that operation. Failure does not imply rollback of writes already committed.
 
 The Search API emits this ordered result pipeline:
 
@@ -256,10 +258,11 @@ Callers that previously relied on omitted `links` or `links=None` for automatic
 input/output edges must now provide explicit links. Match endpoints using each
 operation's data contract; unknown lineage keeps its nodes without a guessed edge.
 
-## Run tests
+## Verify the integration
 
-From the MemOS repository root, in the same Python environment:
-
-```bash
-python -m pytest apps/memtrace-memos-integration/tests -q
-```
+The plugin regression tests are maintained locally and are not included in this directory.
+For an installed integration, follow the Quick start package and entry-point check, enable
+the plugin, and run a memory operation. Inspect the resulting JSON graph's `graph_id`,
+`data.nodes`, and `data.edges`, and check the service logs for writer failures or dropped
+events. Shutdown logs report accepted, processed, dropped, and failed event counts;
+queue acceptance alone does not confirm persistence.

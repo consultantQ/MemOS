@@ -1,8 +1,5 @@
 # ruff: noqa: N999
-"""按业务链组织 Hook 回调, 并保留插件使用的统一入口。
-
-AddHandler / SearchHandler 可独立使用; HookHandlers 提供两者的全部回调。
-"""
+"""Add and Search Hook callbacks behind one plugin interface."""
 
 from memos_smartcomment.handlers.add_handler import AddHandler
 from memos_smartcomment.handlers.search_handler import SearchHandler

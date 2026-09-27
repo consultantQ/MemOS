@@ -211,7 +211,7 @@ flowchart LR
 
 触发边界：反馈请求和空 messages 不产生 add 输入事件；MemReader 只观察 `type="chat"`，成功时要求消息和提取结果都非空。写入成功时，输入/输出都为空就不发事件；写入失败时，无可识别候选输入则不发失败事件。失败表示该操作失败，不承诺底层已经提交的部分写入被回滚。
 
-这里的「写入成功」表示收到了成功 Hook 和返回 ID，插件不独立查询数据库确认。当前工作区的 `MemoryManager._submit_batches()` 捕获批量写入异常后只记录日志，可能导致失败写入仍走成功 Hook。因此不能仅凭 persisted_memory 节点认定实际写入成功；失败节点也依赖业务层正确传播异常。本次核对时，`test_write_failure_hooks.py` 的 4 个用例因此未通过。
+这里的「写入成功」表示被观察的方法返回，并触发成功 Hook 和返回 ID，插件不独立查询数据库确认。MemOS 的底层写入方法可能捕获异常并记录日志，异常未到达 Hook 边界时仍可能触发成功 Hook。因此不能仅凭 persisted_memory 节点认定实际写入成功；失败节点只反映传播至被观察边界的异常，不改变 MemOS 原有异常处理方式。
 
 ### 3.2 持久化配对
 
@@ -254,12 +254,14 @@ flowchart LR
 | `add_enhanced_memories` 成功且有返回 ID | enhanced_memory → persisted_memory；`memory_persistence`，沿用唯一 ID 配对 |
 | `archive_merged_memories` 成功 | memory_ids 对应持久化记忆 → scheduler_result；`memory_archival` |
 | `remove_memories` / `remove_source_memories` 成功 | memory_ids 对应持久化记忆 → scheduler_result；`memory_deletion` |
-| 其他操作成功，如 `refresh_memory_size` | memory_ids 对应持久化记忆 → scheduler_result；`scheduler_operation_result` |
+| 其他符合 source 前缀的操作成功 | memory_ids 对应持久化记忆 → scheduler_result；`scheduler_operation_result` |
 | 失败 | 当前操作输入 → scheduler_result；`scheduler_operation_failed`；增强写入失败保留 enhanced_memory 输入 |
 
-handler 并没有封闭的 operation_name 枚举：上述特殊分支之外，其他符合 source 前缀的名称按通用结果分支处理。成功的 fine-transfer/增强写入如果没有记忆输出，也会生成 scheduler_result；没有输入时保留独立结果节点和 operation，不补造边。
+handler 并没有封闭的 operation_name 枚举：上述特殊分支之外，其他符合 source 前缀的名称按通用结果分支处理。这里描述的是插件收到 Hook 后的处理能力，不代表每个调度调用都有 Hook；当前 MemRead 的 `remove_and_refresh_memory` 没有独立观测点，不生成刷新事件。成功的 fine-transfer/增强写入如果没有记忆输出，也会生成 scheduler_result；没有输入时保留独立结果节点和 operation，不补造边。
 
 fine-transfer 额外记录 `result_grouping`，取自 `operation_input`，缺省 `unknown`：
+
+MemOS 按绑定的 transfer 实现自动判断分组：SimpleStructMemReader 及继承该方法的 Reader 为 `per_input`，MultiModalStructMemReader 为 `batch`，自定义重写为 `unknown`。不读取 Reader 上的显式分组声明。
 
 | `result_grouping` / 输入情况 | 连线规则 |
 | --- | --- |

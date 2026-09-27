@@ -1,5 +1,4 @@
-# SmartComment 桥接层: 每个 recorder 管理一张 trace 图, 把 TraceValue/TraceLink 写入运行时.
-# handlers 决定业务节点与依赖, 此处负责节点身份、操作作用域、快照恢复和导出.
+# Translate semantic events into one SmartComment graph per trace.
 from __future__ import annotations
 
 import json
@@ -21,12 +20,11 @@ _NONE_OPERATION_ID = "__none_op__"
 logger = get_logger(__name__)
 
 
-# 固定字典键顺序, 让相同结构的快照有稳定编码, 用于比较节点内容是否冲突.
+# Use stable encoding when comparing immutable snapshots.
 def _encode(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-# 与 _encode 配对, 供 SmartComment 将节点字符串还原为 JSON 值.
 def _decode(value: str) -> Any:
     return json.loads(value)
 
@@ -34,7 +32,6 @@ def _decode(value: str) -> Any:
 class SmartCommentRecorder:
     """Own one smartcomment graph and append normalized MemOS events to it."""
 
-    # 延迟导入 SmartComment 并创建图; trace、用户和项目身份取自首个事件及插件配置.
     def __init__(self, settings: SmartCommentSettings, first_event: TraceEvent) -> None:
         from smartcomment import (
             comment_graph,
@@ -57,7 +54,6 @@ class SmartCommentRecorder:
             strict=settings.strict,
         )
 
-    # 将插件节点描述转换为 comment_variable 的值与参数, 以业务 identity 控制节点复用.
     @staticmethod
     def _as_comment_item(value: TraceValue) -> tuple[Any, dict[str, Any]]:
         options: dict[str, Any] = {
@@ -72,8 +68,6 @@ class SmartCommentRecorder:
             options["class_name"] = value.class_name
         if value.comment is not None:
             options["comment"] = value.comment
-        # 持久化记忆采用不可变锚点: 始终按身份复用, 不因再次观测到不同正文就生成新版本.
-        # snapshot_status 另外区分仅含 ID 的 reference 与有正文的 complete.
         if value.category == "persisted_memory":
             # A database memory ID is an immutable graph anchor, not a versioned view.
             options["identity_only"] = True
@@ -83,8 +77,7 @@ class SmartCommentRecorder:
             }
         return value.value, options
 
-    # 一次事件对应一个 SmartComment session 和一个 operation; 这不是 MemOS 对话会话.
-    # MemOS 的 session_id 作为元数据保留, 方便从执行图反查业务上下文.
+    # SmartComment sessions describe events; MemOS sessions remain metadata.
     def record(self, event: TraceEvent) -> None:
         session_metadata = {
             "memos_session_id": event.session_id,
@@ -104,7 +97,7 @@ class SmartCommentRecorder:
         nodes: dict[int, Any] = {}
         completions: dict[str, TraceValue] = {}
 
-        # 按本次事件中的 TraceValue 对象缓存注册结果; 跨事件复用由业务 identity 决定.
+        # Cache object registrations within this event; identities handle cross-event reuse.
         def register(value: TraceValue) -> Any:
             key = id(value)
             if key not in nodes:
@@ -117,7 +110,6 @@ class SmartCommentRecorder:
                 ):
                     if node.metadata.get("snapshot_status") == "reference":
                         completions.setdefault(node.full_node_id, value)
-                    # 完整快照出现冲突时只告警, 保留第一次完整内容; strict 模式也遵循这条规则.
                     elif node.raw_value != _encode(value.value):
                         logger.warning(
                             "Ignoring a conflicting snapshot for immutable memory unit %s",
@@ -143,8 +135,7 @@ class SmartCommentRecorder:
         ):
             for value in (*event.inputs, *event.outputs):
                 register(value)
-            # 只按显式 TraceLink 建边, 不做 inputs x outputs 全连接.
-            # 端点即使未单独列入 inputs/outputs 也会注册; link 元数据优先于 operation 元数据.
+            # Register link endpoints even when omitted from inputs/outputs; link metadata wins.
             for link in event.links:
                 self._comment_link(
                     source=register(link.source),
@@ -153,11 +144,9 @@ class SmartCommentRecorder:
                     comment=link.comment,
                     edge_metadata={**operation_metadata, **link.metadata},
                 )
-        # 离开图作用域后再通过导出/导入补全占位, 避免活动作用域仍引用被替换的运行时图.
         if completions:
             self._complete_memory_snapshots(completions)
 
-    # 异步引用先到时只有 ID 占位; 完整写入快照到达后补一次正文, 保留节点 ID 和已有连线.
     def _complete_memory_snapshots(self, completions: dict[str, TraceValue]) -> None:
         """Fill an ID-only placeholder once, preserving its node ID and incident edges."""
         exported = self._graph.export_graph()
@@ -173,7 +162,6 @@ class SmartCommentRecorder:
         # Use the public graph round-trip API after exiting the active graph scope.
         self.restore_graph(exported)
 
-    # 恢复前验证 trace、用户与项目一致; 导入后继续沿用当前配置的严格校验开关.
     def restore_graph(self, data: dict[str, Any]) -> None:
         from smartcomment.runtime import ExecNetwork
 
@@ -184,7 +172,6 @@ class SmartCommentRecorder:
         graph.strict = self._graph.strict
         self._graph = graph
 
-    # 兼容旧版把同一持久化记忆拆成多版本的图: 以最早版本作锚点, 保留首个完整快照.
     @staticmethod
     def _normalize_memory_units(data: dict[str, Any]) -> dict[str, Any]:
         """Reconnect legacy versions to the earliest anchor and first complete snapshot."""
@@ -200,7 +187,7 @@ class SmartCommentRecorder:
                     "cube_id": metadata.get("cube_id"),
                 }
                 metadata["snapshot_status"] = "reference" if is_reference else "complete"
-            # SmartComment 导出节点的 name 承载 id_strategy 产生的身份, 用它聚合同一记忆的版本.
+            # Exported names carry the identity supplied by id_strategy.
             key = (node.get("class_name"), node["name"])
             if key not in anchors:
                 anchors[key] = {**node, "metadata": metadata}
@@ -226,18 +213,19 @@ class SmartCommentRecorder:
                 "edges": [
                     {
                         **edge,
-                        **{
-                            # 旧版本的入边和出边都重定向到锚点, 合并节点时仍保留原始数据依赖.
-                            field: aliases.get(edge[field], edge[field])
-                            for field in ("source_full_node_id", "target_full_node_id")
-                        },
+                        "source_full_node_id": aliases.get(
+                            edge["source_full_node_id"], edge["source_full_node_id"]
+                        ),
+                        "target_full_node_id": aliases.get(
+                            edge["target_full_node_id"], edge["target_full_node_id"]
+                        ),
                     }
                     for edge in graph_data["edges"]
                 ],
             },
         }
 
-    # 导出面向 MemOS 的执行图, 移除 SmartComment 内部 NONE 哨兵及相关边、操作和会话.
+    # Hide SmartComment's internal NONE sentinel and its associated graph elements.
     def export_graph(self) -> dict[str, Any]:
         exported = self._graph.export_graph()
         data = exported["data"]

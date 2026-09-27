@@ -1,6 +1,5 @@
 """Fine-transfer Hooks describe the actual Reader result grouping."""
 
-from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -23,8 +22,7 @@ class CustomTransferReader(SimpleStructMemReader):
 
 
 @pytest.fixture
-def captured_operations(monkeypatch):
-    monkeypatch.setattr("memos.plugins.hooks._hooks", defaultdict(list))
+def captured_operations(clean_hooks):
     captured = []
     register_hook(H.SCHEDULER_MEMORY_OPERATION_AFTER, lambda **kwargs: captured.append(kwargs))
     return captured
@@ -38,18 +36,16 @@ def memory(text):
 
 
 @pytest.mark.parametrize(
-    "reader_class,declared_grouping,expected_grouping",
+    "reader_class,expected_grouping",
     [
-        (SimpleStructMemReader, None, "per_input"),
-        (StrategyStructMemReader, None, "per_input"),
-        (MultiModalStructMemReader, None, "batch"),
-        (CustomTransferReader, None, "unknown"),
-        (CustomTransferReader, "batch", "batch"),
-        (SimpleStructMemReader, "unknown", "unknown"),
+        (SimpleStructMemReader, "per_input"),
+        (StrategyStructMemReader, "per_input"),
+        (MultiModalStructMemReader, "batch"),
+        (CustomTransferReader, "unknown"),
     ],
 )
 def test_scheduler_hook_reports_reader_grouping_without_changing_results(
-    monkeypatch, captured_operations, reader_class, declared_grouping, expected_grouping
+    monkeypatch, captured_operations, reader_class, expected_grouping
 ):
     sources = [memory("first"), memory("missing"), memory("last")]
     enhanced = [memory("first enhanced"), memory("last enhanced")]
@@ -58,8 +54,6 @@ def test_scheduler_hook_reports_reader_grouping_without_changing_results(
     reader.graph_db = None
     reader.memory_version_switch = "off"
     reader.transfer_result = [enhanced]
-    if declared_grouping is not None:
-        reader.fine_transfer_result_grouping = declared_grouping
 
     def process(source, custom_tags, **kwargs):
         if source is sources[1]:
@@ -108,10 +102,9 @@ def test_scheduler_hook_reports_reader_grouping_without_changing_results(
     text_mem.memory_manager.remove_and_refresh_memory.assert_called_once_with(user_name="test-cube")
 
 
-def test_scheduler_failed_hook_keeps_grouping_and_original_error(monkeypatch, captured_operations):
+def test_scheduler_failed_hook_keeps_grouping_and_original_error(captured_operations):
     error = ValueError("synthetic transfer failure")
     reader = CustomTransferReader.__new__(CustomTransferReader)
-    reader.fine_transfer_result_grouping = "batch"
 
     def fail(*args, **kwargs):
         raise error
@@ -131,7 +124,7 @@ def test_scheduler_failed_hook_keeps_grouping_and_original_error(monkeypatch, ca
     )
     assert len(failed) == 1
     assert failed[0]["error"] is error
-    assert failed[0]["operation_input"]["result_grouping"] == "batch"
+    assert failed[0]["operation_input"]["result_grouping"] == "unknown"
     assert all(
         event["hook_context"].source != "scheduler.mem_read.fine_transfer_simple_mem"
         for event in captured_operations

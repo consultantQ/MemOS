@@ -586,7 +586,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
         from memos.mem_reader.simple_struct import SimpleStructMemReader
 
         # Match the bound implementation so inherited methods work, while overrides
-        # with a different grouping contract remain unknown unless explicitly declared.
+        # with a different grouping contract remain unknown.
         transfer = getattr(mem_reader.fine_transfer_simple_mem, "__func__", None)
         if transfer is MultiModalStructMemReader.fine_transfer_simple_mem:
             return "batch"

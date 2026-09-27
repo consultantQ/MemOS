@@ -1,7 +1,4 @@
-"""添加与搜索共用的上下文解析、快照和事件构造。
-
-这里只处理追踪数据, 不保存业务链的关联状态, 也不执行数据库操作。
-"""
+"""Shared correlation, detached snapshots, and event construction."""
 
 from __future__ import annotations
 
@@ -11,34 +8,33 @@ from typing import Any
 from memos_smartcomment.events import TraceEvent, TraceLink, TraceValue
 from memos_smartcomment.serialization import to_jsonable
 
+
+# isort: split
 from memos.log import get_logger
 
 
 logger = get_logger(__name__)
-# 哨兵区分没有 trace_id 字段与显式 trace_id=None, 后者不能借用其他任务的线程上下文。
+# Distinguish a missing trace field from an explicitly empty trace.
 _MISSING_TRACE = object()
 
 
-# 兼容字典与对象属性, 让回调可处理 MemOS 模型、HookContext 以及测试替身.
 def _get(value: Any, name: str, default: Any | None = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
 
 
-# 统一正文入口: 优先 memory 字段, 仅在其为 None 时退回 text 字段.
 def _memory_text(memory: Any) -> Any:
     text = _get(memory, "memory")
     return text if text is not None else _get(memory, "text")
 
 
-# 决定事件归属哪张图: 显式 trace 优先, 缺少字段时才查线程上下文, 最后按用户/会话兜底.
 def _current_trace_id(subject: Any | None = None) -> str:
     trace_id = _get(subject, "trace_id", _MISSING_TRACE)
     if trace_id is not _MISSING_TRACE and trace_id and trace_id != "trace-id":
         return str(trace_id)
 
-    # 只有调用方未提供 trace 字段时才读取环境上下文; 避免调度批次中串用其他消息的 trace.
+    # An explicitly empty trace must not borrow ambient request context.
     if trace_id is _MISSING_TRACE:
         try:
             from memos.context.context import get_current_trace_id
@@ -49,7 +45,6 @@ def _current_trace_id(subject: Any | None = None) -> str:
         except Exception:
             logger.debug("MemOS request context is unavailable", exc_info=True)
 
-    # 无 trace 时优先使用 MemReader 和 add 共有的 user/session; task_id 仅在无 user 时兜底.
     user_id = _get(subject, "user_id")
     if user_id is None:
         if task_id := _get(subject, "task_id"):
@@ -59,7 +54,7 @@ def _current_trace_id(subject: Any | None = None) -> str:
     return f"standalone:{user_id}:{session_id}"
 
 
-# 兼容添加、搜索和 HookContext 的不同 cube 字段名; 去重时保留原顺序.
+# Accept the cube aliases used by add, search and scheduler contexts.
 def _cube_ids(subject: Any) -> tuple[str, ...]:
     raw = (
         _get(subject, "writable_cube_ids")
@@ -85,11 +80,10 @@ class BaseHandler:
         self._submit = submit
         self._max_value_chars = max_value_chars
 
-    # 在当前 Hook 线程同步复制并脱敏, 防止排队期间原始业务对象被其他线程修改.
+    # Snapshot synchronously so the worker cannot observe later business mutations.
     def _snapshot(self, value: Any) -> Any:
         return to_jsonable(value, max_value_chars=self._max_value_chars)
 
-    # 统一节点构造入口: 正文和元数据都经过快照处理, 不把业务对象引用交给写入线程.
     def _value(
         self,
         *,
@@ -113,7 +107,6 @@ class BaseHandler:
             metadata=self._snapshot(metadata or {}),
         )
 
-    # 统一补齐 trace、用户、会话、cube 和 operation_id 等关联信息; 节点与连线由调用方提供.
     def _event(
         self,
         subject: Any,
@@ -142,21 +135,19 @@ class BaseHandler:
             metadata=self._snapshot(event_metadata),
         )
 
-    # 追踪提交失败只记录日志, 不让队列出口的异常改变原业务调用结果.
+    # Tracing failures must not change business results.
     def _emit(self, event: TraceEvent) -> None:
         try:
             self._submit(event)
         except Exception:
             logger.exception("Failed to enqueue smartcomment event: %s", event.operation)
 
-    # 从 HookContext 提取关联字段, 不把上下文对象本身画成节点.
-    # 这里的 user_name 是记忆存储使用的 cube 标识兜底, 与 user_id 是不同概念.
+    # Here user_name identifies the storage cube, not the user.
     @staticmethod
     def _hook_subject(context: Any, *, user_name: Any | None = None) -> dict[str, Any]:
         subject = {
             key: value
             for key in (
-                "trace_id",
                 "task_id",
                 "user_id",
                 "session_id",
@@ -164,7 +155,7 @@ class BaseHandler:
             )
             if (value := _get(context, key)) is not None
         }
-        # 保留显式 None trace 的语义, 让 _current_trace_id 不误用工作线程残留的 trace.
+        # Preserve None so worker-local trace context cannot leak into this operation.
         if context is not None:
             subject["trace_id"] = _get(context, "trace_id")
         cube_ids = _get(context, "cube_ids")
@@ -174,7 +165,6 @@ class BaseHandler:
             subject.setdefault("cube_id", user_name)
         return subject
 
-    # 没有成功业务输出时, 用 failed 字符串作为图中终点; 异常对象不作为节点保存.
     def _operation_status_value(self, subject: Any, *, stage: str) -> TraceValue:
         operation_id = _get(subject, "operation_id") or _current_trace_id(subject)
         return self._value(
@@ -188,10 +178,7 @@ class BaseHandler:
             metadata={"memos_stage": stage, "status": "failed"},
         )
 
-    # 按业务 identity 合并节点描述; 同身份保留最后一份值, 列表位置沿用首次出现顺序.
+    # Keep the last value for each identity in first-occurrence order.
     @staticmethod
     def _unique_values(values: list[TraceValue]) -> tuple[TraceValue, ...]:
-        d = {}
-        for value in values:
-            d[value.identity] = value
-        return tuple(d.values())
+        return tuple({value.identity: value for value in values}.values())
