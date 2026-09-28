@@ -101,7 +101,9 @@ Hook callbacks live in `memos_smartcomment/handlers/`:
 - `__init__.py`: `HookHandlers` combines both flows and clears both caches at shutdown.
   The existing `from memos_smartcomment.handlers import HookHandlers` import is unchanged.
 
-Each handler lists Hook callbacks before its internal helpers. `AddHandler` and
+Each handler lists Hook callbacks before its shared processing flow, followed by
+correlation state, node construction, and lineage helpers. Short section comments mark
+these responsibilities. `AddHandler` and
 `SearchHandler` can also be instantiated independently with an event submission callable.
 
 ### Captured memory flow
@@ -139,8 +141,10 @@ A persisted memory unit is one immutable graph anchor per cube and memory ID. It
 complete snapshot is retained; different later observations log a warning without replacing
 it or creating a new version, including in strict mode. If an asynchronous reference arrives
 before the write event, its ID-only placeholder is completed once without changing the node
-ID or existing edges. Restoring older snapshots also joins split versions of persisted units
-to their earliest anchor and retains the first complete snapshot and all incident edges.
+ID or existing edges. Current-format snapshots restore those anchors and edges directly,
+including after cache eviction. Historical formats with split persisted-memory versions
+or missing `snapshot_status` metadata are no longer migrated; use a separate output
+directory instead of appending to those artifacts.
 
 Fine-transfer Hooks declare `operation_input.result_grouping`: `per_input` means
 one group per input in input order, including empty groups for failures; `batch`
@@ -210,6 +214,28 @@ are not connected merely because one ran after another; the graph contains only 
 data-flow edges. When an operation has no data output, its `scheduler_result` string is used
 as the target of edges from the memory values it consumed.
 
+### Trace field conventions
+
+Keep machine identifiers separate from reader-facing descriptions:
+
+- `identity` controls node reuse; SmartComment exports it as the node `name`.
+  The unused internal `TraceValue.name` field has been removed.
+- Node `category` names a business role; `class_name` is a type/identity namespace.
+  Existing names are retained because consumers and node IDs can depend on them.
+- `TraceEvent.operation` is the stable dotted operation name; its optional `comment`
+  explains the observation in the exported operation and session. Each built-in link
+  has its own description of the source-to-target relationship.
+- Write comments describe returned IDs, not independently confirmed database writes.
+  Search comments distinguish bucket-local rank from traversal order, and removal
+  from search results from deletion in storage. Scheduler comments identify the backend
+  operation, including `delete` versus `soft_delete`, without claiming every input was removed.
+
+These comments are displayed by graph viewers and MemTrace notebooks; they are not
+parsing keys. The complete field tables and reading order are in
+[`CONVENTIONS.md`](memos_smartcomment/CONVENTIONS.md).
+
+### Correlation and snapshot isolation
+
 Each add receives a fresh UUID for its message batch, including repeated adds that reuse
 the same Python list. A bounded registry correlates the live request with MemReader
 callbacks for each target cube. The registry uses weak references for API requests and
@@ -254,8 +280,7 @@ event = TraceEvent(
 )
 ```
 
-Callers that previously relied on omitted `links` or `links=None` for automatic
-input/output edges must now provide explicit links. Match endpoints using each
+Always provide explicit links for known dependencies. Match endpoints using each
 operation's data contract; unknown lineage keeps its nodes without a guessed edge.
 
 ## Verify the integration

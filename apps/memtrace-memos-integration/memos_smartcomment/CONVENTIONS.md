@@ -10,23 +10,22 @@
 
 | 对象 | 表示什么 | 关键字段 |
 | --- | --- | --- |
-| `TraceValue` | 一份业务值快照，最终注册为图节点 | `name`、`value`、`identity`、`class_name`、`category`、`identity_only`、`comment`、`metadata`、`match_key` |
-| `TraceEvent` | 一次 Hook 观测，最终建立一个 session 和一个 operation | `operation`、`category`、`trace_id`、用户/会话/cube 关联信息、`inputs`、`outputs`、`links`、`metadata`、`event_id`、`created_at` |
+| `TraceValue` | 一份业务值快照，最终注册为图节点 | `value`、`identity`、`class_name`、`category`、`identity_only`、`comment`、`metadata`、`match_key` |
+| `TraceEvent` | 一次 Hook 观测，最终建立一个 session 和一个 operation | `operation`、`category`、`comment`、`trace_id`、用户/会话/cube 关联信息、`inputs`、`outputs`、`links`、`metadata`、`event_id`、`created_at` |
 | `TraceLink` | 来源值到目标值的显式数据依赖 | `source`、`target`、`category`、`comment`、`metadata` |
 
 `inputs` 和 `outputs` 只注册节点，**不会自动生成输入与输出之间的边**。只有 `links` 生成边；未单独列入输入/输出的 link 端点也会注册。操作发生的时间先后不构成连线依据。
 
 ### 1.1 `identity`、`name`、`full_node_id` 的区别
 
-当前 `TraceValue` 的字段叫 **`identity`，没有 `identity_id` 字段**。本地 SmartComment 的节点导出也使用 `name`、`full_name`、`node_id`、`full_node_id`。如果讨论中说「identity_id」，应先明确是业务身份还是带版本的图节点 ID。
+`TraceValue.identity` 是业务身份；导出图使用 `name`、`full_name`、`node_id`、`full_node_id` 表示身份及其版本。未被消费的内部 `TraceValue.name` 已删除，导出节点的 `name` 字段不变。
 
 Recorder 用 `id_strategy` 返回 `TraceValue.identity`，因此映射如下：
 
 | 字段 | 当前含义/构成 |
 | --- | --- |
-| `TraceValue.name` | handler 内的业务名称，如 `messages`、`query`、`raw_text_mem_1`；当前 recorder 不将它传给 SmartComment |
 | `TraceValue.identity` | handler 构造的业务身份字符串 |
-| 导出节点 `name` | 等于 `TraceValue.identity`，不是 `TraceValue.name` |
+| 导出节点 `name` | 等于 `TraceValue.identity` |
 | 导出节点 `full_name` | `{class_name}:{identity}`；没有 `class_name` 时为 `{identity}` |
 | 导出节点 `node_id` | `{identity}@{version}` |
 | 导出节点 `full_node_id` | `{class_name}:{identity}@{version}`；边的 source/target 使用此字段 |
@@ -69,9 +68,25 @@ cube 列表取第一个非空字段：`writable_cube_ids → readable_cube_ids �
 | 普通节点，身份相同但 value 不同，`identity_only=False` | 非 strict 模式创建新版本；strict 模式报一致性错误 |
 | `category="persisted_memory"` | recorder 强制按身份复用，使用下面的不可变锚点规则 |
 
-持久化记忆由 `(cube_id, memory_id)` 标识，保留第一次完整正文快照。仅有 ID 时先创建占位；完整快照到达后补全一次，保留原节点 ID 和连线。此后内容冲突只告警，不覆盖或升版，strict 模式也相同。恢复旧图时，同一持久化身份的多个版本合并到最早锚点，并保留首个完整快照及关联边。
+持久化记忆由 `(cube_id, memory_id)` 标识，保留第一次完整正文快照。仅有 ID 时先创建占位；完整快照到达后补全一次，保留原节点 ID 和连线。此后内容冲突只告警，不覆盖或升版，strict 模式也相同。当前格式快照直接恢复，保留已有身份和边；不再迁移缺少 `snapshot_status` 或把持久化锚点拆成多个版本的历史图。此类历史产物应使用独立目录保存，不继续追加。
 
 普通节点复用时，不会因为新一次观测的 metadata/comment 不同就自动更新它们；逐次操作信息应查看对应 operation/edge。持久化占位补全是 recorder 的专门处理。
+
+### 1.4 分类、操作名与说明文字
+
+| 字段 | 用途与命名规则 |
+| --- | --- |
+| 节点 `category` | 值在流程中的业务角色，使用 snake_case 名词，如 `extracted_memory`、`persisted_memory`。相同正文在不同阶段可有不同角色。 |
+| 节点 `class_name` | SmartComment 类型/身份命名空间，不是阶段名；`memory` 共用于提取、增强和持久化记忆，`str` 用于查询和状态。改名会改变 `full_node_id`。 |
+| `TraceEvent.operation` | 稳定的操作标识，以 `memos.` 开头，点号分隔流程和动作；Scheduler 保留调用点及 `after/failed` 后缀。与业务关联 ID `operation_id` 不同。 |
+| 事件/边 `category` | 操作或依赖关系的类别，如 `memory_persistence`、`memory_filtered`，不要求与节点类别相同。 |
+| 节点 `comment` | 说明捕获了什么值及其观测边界；候选排名注明桶内范围，状态节点不冒充业务输出。 |
+| 事件 `comment` | 说明本次操作的业务意图和实际观测结果，写入导出 operation/session 的 `comment`。自定义事件未提供时保留按 operation 生成的默认说明。 |
+| 连线 `comment` | 解释为什么从来源值连向目标值；所有内置流程显式提供，不用操作名代替依赖含义。 |
+
+说明使用简短英文句子，不作为身份、分类或程序分支依据。`persisted_memory` 表示写入返回 ID 对应的图锚点，不是独立数据库确认；`filtered` 表示候选不再出现在当前结果，不是删除存储中的记忆；`after`/`completed` 表示方法返回，`failed` 表示异常到达 Hook 边界，不表示回滚。
+
+本轮保留现有 category/class_name/operation 取值。MemTrace 通用图展示和 notebook 会显示 comment；部分 QA 工具另按 `class_name="query"`、`category="message"` 或 `"message & query"` 识别查询，不能据此把本插件的 Search 观测图当作完整 QA 图。本次不修改这些消费方或扩展 QA 适配。
 
 ## 2. `TraceValue` 节点总表
 
@@ -79,13 +94,13 @@ cube 列表取第一个非空字段：`writable_cube_ids → readable_cube_ids �
 
 ### 2.1 AddHandler：输入、提取、持久化与后台增强
 
-| `TraceValue.name` | `category` | `class_name` | `identity` | `value` |
+| 业务含义 | `category` | `class_name` | `identity` | `value` |
 | --- | --- | --- | --- | --- |
-| `messages` | `message_batch` | `message_batch` | `message_batch:{trace}:{uuid4.hex}` | messages 的快照 |
-| `extracted_memory` | `extracted_memory` | `memory` | `extracted_memory:{trace}:{cube}:{memory_id}` | 记忆正文 |
-| `persisted_memory` | `persisted_memory` | `memory` | `memory:{cube}:{memory_id}` | 完整时为正文；引用/来源未知时为 `{"memory_id": ..., "cube_id": ...}` |
-| `enhanced_memory` | `enhanced_memory` | `memory` | `enhanced_memory:{trace}:{cube}:{memory_id}` | 生成时为正文；后续持久化引用时为 ID/cube 字典 |
-| `scheduler_result` | `scheduler_result` | `str` | `scheduler_result:{operation_id or 'unknown'}:{status}` | `"{operation_name} completed"` 或 `"{operation_name} failed"` |
+| 消息批次 | `message_batch` | `message_batch` | `message_batch:{trace}:{uuid4.hex}` | messages 的快照 |
+| 提取候选 | `extracted_memory` | `memory` | `extracted_memory:{trace}:{cube}:{memory_id}` | 记忆正文 |
+| 写入锚点 / 存储引用 | `persisted_memory` | `memory` | `memory:{cube}:{memory_id}` | 完整时为正文；引用/来源未知时为 `{"memory_id": ..., "cube_id": ...}` |
+| 增强记忆 | `enhanced_memory` | `memory` | `enhanced_memory:{trace}:{cube}:{memory_id}` | 生成时为正文；后续持久化引用时为 ID/cube 字典 |
+| 调度观测状态 | `scheduler_result` | `str` | `scheduler_result:{operation_id or 'unknown'}:{status}` | `"{operation_name} completed"` 或 `"{operation_name} failed"` |
 
 正文统一优先取 `memory` 字段，仅当其为 `None` 时取 `text`；空字符串是有效正文。Add 遍历记录时要求同时有 ID 和正文，ID 优先取 `memory_id`，再取 `id`；不会递归遍历 `metadata/info/internal_info` 包装字段。
 
@@ -108,11 +123,11 @@ Recorder 对导出的 `persisted_memory.metadata` 额外添加 `snapshot_status=
 
 ### 2.2 SearchHandler：查询与各阶段候选
 
-| `TraceValue.name` | `category` | `class_name` | `identity` | `value` |
+| 业务含义 | `category` | `class_name` | `identity` | `value` |
 | --- | --- | --- | --- | --- |
-| `query` | `search_query` | `str` | `search_query:{search_scope}` | 请求 query；无字段时默认空字符串 |
-| `{stage}_{result_type}_{rank}` | `search_memory` | `search_memory` | `search_memory:{search_scope}:{stage}:{result_type}:{cube_scope}:{occurrence_id}:{global_position}` | `memory_id`、`memory`、`result_type`、`cube_id`、`score` 五字段字典 |
-| `{stage}_filtered` | `search_filter_result` | `str` | `search_filter_result:{search_scope}:{stage}` | 固定字符串 `"filtered"` |
+| 搜索查询 | `search_query` | `str` | `search_query:{search_scope}` | 请求 query；无字段时默认空字符串 |
+| 阶段候选 | `search_memory` | `search_memory` | `search_memory:{search_scope}:{stage}:{result_type}:{cube_scope}:{occurrence_id}:{global_position}` | `memory_id`、`memory`、`result_type`、`cube_id`、`score` 五字段字典 |
+| 候选移除状态 | `search_filter_result` | `str` | `search_filter_result:{search_scope}:{stage}` | 固定字符串 `"filtered"` |
 
 | 搜索身份/位置字段 | 规则 |
 | --- | --- |
@@ -166,7 +181,7 @@ SHA256(UTF8(JSON([result_type, cube_scope, ["id", str(memory_id)]])))
 
 | 字段 | 取值 |
 | --- | --- |
-| `name / category` | 均为 `operation_status` |
+| `category` | `operation_status` |
 | `class_name / value` | `str` / `"failed"` |
 | `identity` | `operation_status:{operation_id or trace_id}:{stage}` |
 | `metadata` | `memos_stage=stage`、`status="failed"` |
@@ -347,6 +362,8 @@ session_metadata = {
 
 `user_id` 由 graph 持有并进入 SmartComment 对象的顶层字段，不在以上公共 metadata 字典中。link 未指定 category/comment 时沿用 operation；`event.category` 同时作为 operation 和 session 的 category，**不会把节点 category 改成操作 category**。
 
+内置 handler 为事件及每条边分别提供说明；自定义 `TraceLink.comment=None` 仍继承操作说明。说明文字不放进 metadata，也不参与节点身份或跨阶段匹配。
+
 目前只有持久化配对边显式添加 link metadata，其他 handler 边使用空字典并继承 operation metadata。
 
 ## 6. 快照、导出与边界
@@ -370,6 +387,14 @@ session_metadata = {
 输出文件按 user/trace 隔离，目录名和文件名为经过清洗且最多 80 字符的可读前缀，加原始 ID 的 JSON 编码的 SHA-256；文件原子替换，后续事件可恢复已有图。缓存淘汰不删除磁盘快照。配置和运行方式见 [应用 README](../README.md)。
 
 ## 7. 查代码与扩展时的检查点
+
+阅读顺序：
+
+- `add_handler.py`：同步 Add 回调 → MemRead 回调及调度流程 → 消息关联状态 → 节点构造 → 来源配对。
+- `search_handler.py`：按阶段排列的回调 → 共用阶段处理流程 → operation 关联及清理 → 候选快照 → 跨阶段匹配。
+- `base.py`：上下文字段适配 → 快照/事件构造与提交 → Hook 关联 → 公用失败节点与去重。
+- `adapter.py`：请求侧 start/submit/flush/close → 工作线程的快照读写 → 缓存管理与处理循环。
+- `recorder.py`：值注册与显式连边 → 占位补全 → 当前格式恢复与导出。
 
 | 问题 | 主要实现 |
 | --- | --- |

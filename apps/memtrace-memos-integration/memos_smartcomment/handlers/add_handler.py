@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 _MEM_READ_SOURCE_PREFIX = "scheduler.mem_read."
 
 
-# Only infer a cube when ownership is unambiguous.
+# Input adapters: preserve record order and only infer unambiguous cube ownership.
 def _single_cube_id(subject: Any) -> str | None:
     cube_ids = _cube_ids(subject)
     return cube_ids[0] if len(cube_ids) == 1 else None
@@ -85,6 +85,7 @@ class AddHandler(BaseHandler):
         with self._message_batches_lock:
             self._message_batches.clear()
 
+    # Synchronous add Hooks: messages -> extracted candidates -> observed write results.
     def on_add_before(self, *, request: Any, **_kwargs: Any) -> None:
         if bool(_get(request, "is_feedback", False)):
             return
@@ -105,6 +106,7 @@ class AddHandler(BaseHandler):
                 request,
                 operation="memos.add.message_input",
                 category="memory_add_request",
+                comment="Capture the message batch submitted for memory extraction.",
                 outputs=(message,),
                 metadata=metadata,
             )
@@ -161,10 +163,16 @@ class AddHandler(BaseHandler):
                 subject,
                 operation="memos.mem_reader.extract",
                 category="memory_extraction",
+                comment="Extract memory candidates from this message batch; no write is implied.",
                 inputs=(message,),
                 outputs=extracted,
                 links=tuple(
-                    TraceLink(source=message, target=memory, category="memory_extraction")
+                    TraceLink(
+                        source=message,
+                        target=memory,
+                        category="memory_extraction",
+                        comment="Extract this memory candidate from the source message batch.",
+                    )
                     for memory in extracted
                 ),
                 metadata=metadata,
@@ -196,9 +204,17 @@ class AddHandler(BaseHandler):
                 subject,
                 operation="memos.mem_reader.extract.failed",
                 category="memory_extraction",
+                comment="Observe an exception at the MemReader extraction boundary.",
                 inputs=(message,),
                 outputs=(status,),
-                links=(TraceLink(source=message, target=status, category="operation_failed"),),
+                links=(
+                    TraceLink(
+                        source=message,
+                        target=status,
+                        category="operation_failed",
+                        comment="Extraction from this message batch raised an observed exception.",
+                    ),
+                ),
                 metadata={
                     "memos_stage": "mem_reader.extract.failed",
                     "status": "failed",
@@ -234,6 +250,10 @@ class AddHandler(BaseHandler):
                 subject,
                 operation="memos.text_memory.persist",
                 category="memory_persistence",
+                comment=(
+                    "Observe returned memory IDs and match them to unique write inputs; "
+                    "database persistence is not independently verified."
+                ),
                 inputs=self._unique_values(inputs),
                 outputs=self._unique_values(outputs),
                 links=tuple(links),
@@ -269,10 +289,22 @@ class AddHandler(BaseHandler):
                 subject,
                 operation="memos.text_memory.persist.failed",
                 category="memory_persistence",
+                comment=(
+                    "Observe an exception at the memory-write boundary; "
+                    "earlier writes may already have taken effect."
+                ),
                 inputs=tuple(inputs),
                 outputs=(status,),
                 links=tuple(
-                    TraceLink(source=value, target=status, category="operation_failed")
+                    TraceLink(
+                        source=value,
+                        target=status,
+                        category="operation_failed",
+                        comment=(
+                            "Writing this input was part of an operation that raised an "
+                            "observed exception; this does not imply rollback."
+                        ),
+                    )
                     for value in inputs
                 ),
                 metadata={
@@ -284,6 +316,7 @@ class AddHandler(BaseHandler):
             )
         )
 
+    # MemRead Hooks: dispatch observed background operations without repeating their work.
     def on_scheduler_memory_operation_after(
         self,
         *,
@@ -320,6 +353,140 @@ class AddHandler(BaseHandler):
             status="failed",
         )
 
+    def _on_scheduler_memory_operation(
+        self,
+        *,
+        hook_context: HookContext,
+        operation: Any,
+        target: Any,
+        operation_input: Any,
+        result: Any | None = None,
+        error: BaseException | None = None,
+        status: str,
+    ) -> None:
+        source = str(_get(hook_context, "source", ""))
+        # Other handlers share this Hook; only interpret MemRead operations.
+        if not source.startswith(_MEM_READ_SOURCE_PREFIX):
+            return
+
+        operation_name = source.removeprefix(_MEM_READ_SOURCE_PREFIX)
+        description = {
+            "fine_transfer_simple_mem": "Refine source memories into enhanced memories",
+            "add_enhanced_memories": "Write enhanced memories and observe returned memory IDs",
+            "archive_merged_memories": "Mark merged source memories as archived",
+            "remove_memories": "Request deletion of source memories",
+            "remove_source_memories": "Request deletion of source memories",
+        }.get(operation_name, f"Run MemRead operation {operation_name}")
+        outcome = "the method returned" if status == "after" else "an exception reached the Hook"
+        operation_comment = (
+            f"{description} (backend operation: {operation}); {outcome}. "
+            "Database effects are not independently verified."
+        )
+        if not isinstance(operation_input, Mapping):
+            operation_input = {}
+        subject = self._hook_subject(hook_context, user_name=operation_input.get("user_name"))
+        cube_id = _single_cube_id(subject)
+
+        inputs: list[TraceValue] = []
+        outputs: list[TraceValue] = []
+        links: list[TraceLink] = []
+        if status == "after" and operation_name == "fine_transfer_simple_mem":
+            inputs, outputs, links = self._fine_transfer_values(
+                subject,
+                operation_input,
+                result,
+                cube_id=cube_id,
+            )
+        elif operation_name == "add_enhanced_memories":
+            inputs, outputs, links = self._persistence_values(
+                subject,
+                operation_input.get("memories"),
+                result if status == "after" else (),
+                cube_id=cube_id,
+                enhanced=True,
+            )
+            lineage = self._persistence_lineage(outputs, links)
+        else:
+            inputs = self._scheduler_persisted_inputs(
+                operation_name,
+                operation_input,
+                cube_id=cube_id,
+            )
+
+        # Operations without memory outputs still have an observable status.
+        if not outputs:
+            if status == "failed":
+                category = "scheduler_operation_failed"
+                comment = (
+                    "This memory was an input to a MemRead operation that raised an "
+                    "observed exception; this does not imply rollback."
+                )
+            elif operation_name == "archive_merged_memories":
+                category = "memory_archival"
+                comment = (
+                    "The archive method returned for this source memory; "
+                    "the plugin does not independently verify its stored status."
+                )
+            elif operation_name in {"remove_memories", "remove_source_memories"}:
+                category = "memory_deletion"
+                comment = (
+                    f"The {operation} method returned with this memory among its inputs; "
+                    "this does not confirm removal, and soft-delete may preserve selected IDs."
+                )
+            else:
+                category = "scheduler_operation_result"
+                comment = (
+                    f"The {operation_name} method returned without a memory output "
+                    "for this observed input group."
+                )
+            result_value = self._scheduler_result_value(
+                hook_context,
+                operation_name=operation_name,
+                status=status,
+                comment=operation_comment,
+            )
+            outputs.append(result_value)
+            links.extend(
+                TraceLink(
+                    source=value,
+                    target=result_value,
+                    category=category,
+                    comment=comment,
+                )
+                for value in inputs
+            )
+
+        metadata = {
+            "memos_stage": f"{source}.{status}",
+            "handler": "mem_read",
+            "operation_name": operation_name,
+            "operation": operation,
+            "target": target,
+            "status": status,
+        }
+        if operation_name == "fine_transfer_simple_mem":
+            metadata["result_grouping"] = operation_input.get("result_grouping", "unknown")
+            if status == "after" and any(value.category == "enhanced_memory" for value in outputs):
+                metadata["lineage_status"] = "resolved" if links else "unresolved"
+        elif operation_name == "add_enhanced_memories" and status == "after":
+            metadata["lineage_status"] = lineage
+        if status == "failed":
+            # Record only the exception type; messages can expose business data.
+            metadata["error_type"] = type(error).__name__
+        self._emit(
+            self._event(
+                subject,
+                operation=f"memos.{source}.{status}",
+                category="scheduler_memory_operation",
+                comment=operation_comment,
+                inputs=self._unique_values(inputs),
+                outputs=self._unique_values(outputs),
+                links=tuple(links),
+                metadata=metadata,
+            )
+        )
+
+    # Message correlation: creation registers a batch; references consume one cube's claim.
     @staticmethod
     def _message_batch_key(subject: Any, messages: Any) -> tuple[str, str | None, int]:
         return _current_trace_id(subject), _get(subject, "user_id"), id(messages)
@@ -369,6 +536,7 @@ class AddHandler(BaseHandler):
                 return messages
         return scene_data
 
+    # Node construction: identity selects the anchor; comment explains the captured value.
     def _message_value(
         self,
         subject: Any,
@@ -378,13 +546,12 @@ class AddHandler(BaseHandler):
         metadata: dict[str, Any] | None = None,
     ) -> TraceValue:
         return self._value(
-            name="messages",
             value=messages,
             identity=self._message_identity(subject, messages, reference=identity_only),
             category="message_batch",
             class_name="message_batch",
             identity_only=identity_only,
-            comment=("Message batch received at MemOS stage add.before."),
+            comment="Message batch supplied to MemOS for memory extraction.",
             metadata=metadata,
         )
 
@@ -400,13 +567,12 @@ class AddHandler(BaseHandler):
     ) -> TraceValue:
         trace_id = _current_trace_id(subject)
         return self._value(
-            name="extracted_memory",
             value=_memory_text(memory),
             identity=f"extracted_memory:{trace_id}:{cube_id or 'unknown'}:{memory_id}",
             category="extracted_memory",
             class_name="memory",
             identity_only=identity_only,
-            comment=("Memory candidate produced at MemOS stage mem_reader.extract.after."),
+            comment="Memory candidate from MemReader extraction; not a write confirmation.",
             metadata=metadata,
         )
 
@@ -420,7 +586,6 @@ class AddHandler(BaseHandler):
         stage: str = "text_memory.add.after",
     ) -> TraceValue:
         return self._value(
-            name="persisted_memory",
             value=(
                 _memory_text(memory)
                 if memory is not None
@@ -431,7 +596,8 @@ class AddHandler(BaseHandler):
             class_name="memory",
             identity_only=memory is None,
             comment=(
-                f"Textual memory successfully persisted at MemOS stage {stage}."
+                f"Memory snapshot matched to an ID returned at {stage}; "
+                "database persistence is not independently verified."
                 if memory is not None
                 else f"Write returned this memory ID at {stage}; its source and content are unresolved."
             ),
@@ -449,13 +615,15 @@ class AddHandler(BaseHandler):
         memory_id: str,
     ) -> TraceValue:
         return self._value(
-            name="persisted_memory",
             value={"memory_id": memory_id, "cube_id": cube_id},
             identity=f"memory:{cube_id or 'unknown'}:{memory_id}",
             category="persisted_memory",
             class_name="memory",
             identity_only=True,
-            comment="Reference to a memory unit previously persisted by MemOS.",
+            comment=(
+                "Memory ID supplied to a MemRead operation; "
+                "this reference alone does not confirm its content or database state."
+            ),
             metadata={"cube_id": cube_id, "memory_id": memory_id},
         )
 
@@ -472,7 +640,6 @@ class AddHandler(BaseHandler):
             {"memory_id": memory_id, "cube_id": cube_id} if identity_only else _memory_text(memory)
         )
         return self._value(
-            name="enhanced_memory",
             value=value,
             identity=(
                 f"enhanced_memory:{_current_trace_id(subject)}:{cube_id or 'unknown'}:{memory_id}"
@@ -490,17 +657,17 @@ class AddHandler(BaseHandler):
         *,
         operation_name: str,
         status: str,
+        comment: str,
     ) -> TraceValue:
         operation_id = _get(hook_context, "operation_id") or "unknown"
         result = f"{operation_name} {'completed' if status == 'after' else 'failed'}"
         return self._value(
-            name="scheduler_result",
             value=result,
             identity=f"scheduler_result:{operation_id}:{status}",
             category="scheduler_result",
             class_name="str",
             identity_only=False,
-            comment=f"String result for MemRead scheduler operation {operation_name}.",
+            comment=comment,
             metadata={
                 "operation_id": operation_id,
                 "operation_name": operation_name,
@@ -508,6 +675,7 @@ class AddHandler(BaseHandler):
             },
         )
 
+    # Lineage construction: connect only grouping- or ID-backed sources, never guess by position.
     def _fine_transfer_values(
         self,
         subject: Any,
@@ -550,7 +718,10 @@ class AddHandler(BaseHandler):
                         source=source,
                         target=target,
                         category="memory_refinement",
-                        comment="Refine persisted memory in the MemRead scheduler.",
+                        comment=(
+                            "This source memory contributed to the fine-transfer group "
+                            "that produced the target enhanced memory."
+                        ),
                     )
                     for source in source_values
                 )
@@ -610,7 +781,11 @@ class AddHandler(BaseHandler):
                         source=inputs[source_index],
                         target=target,
                         category="memory_persistence",
-                        comment=f"Persist the memory with the matching ID at {stage}.",
+                        comment=(
+                            f"Match this input memory to the ID returned at {stage}; "
+                            "the edge records write-result lineage, not independent "
+                            "database confirmation."
+                        ),
                         metadata={"pair_index": index, "input_index": source_index},
                     )
                 )
@@ -644,110 +819,3 @@ class AddHandler(BaseHandler):
             self._persisted_memory_reference(cube_id=cube_id, memory_id=str(memory_id))
             for memory_id in memory_ids
         ]
-
-    def _on_scheduler_memory_operation(
-        self,
-        *,
-        hook_context: HookContext,
-        operation: Any,
-        target: Any,
-        operation_input: Any,
-        result: Any | None = None,
-        error: BaseException | None = None,
-        status: str,
-    ) -> None:
-        source = str(_get(hook_context, "source", ""))
-        # Other handlers share this Hook; only interpret MemRead operations.
-        if not source.startswith(_MEM_READ_SOURCE_PREFIX):
-            return
-
-        operation_name = source.removeprefix(_MEM_READ_SOURCE_PREFIX)
-        if not isinstance(operation_input, Mapping):
-            operation_input = {}
-        subject = self._hook_subject(hook_context, user_name=operation_input.get("user_name"))
-        cube_id = _single_cube_id(subject)
-
-        inputs: list[TraceValue] = []
-        outputs: list[TraceValue] = []
-        links: list[TraceLink] = []
-        if status == "after" and operation_name == "fine_transfer_simple_mem":
-            inputs, outputs, links = self._fine_transfer_values(
-                subject,
-                operation_input,
-                result,
-                cube_id=cube_id,
-            )
-        elif operation_name == "add_enhanced_memories":
-            inputs, outputs, links = self._persistence_values(
-                subject,
-                operation_input.get("memories"),
-                result if status == "after" else (),
-                cube_id=cube_id,
-                enhanced=True,
-            )
-            lineage = self._persistence_lineage(outputs, links)
-        else:
-            inputs = self._scheduler_persisted_inputs(
-                operation_name,
-                operation_input,
-                cube_id=cube_id,
-            )
-
-        # Operations without memory outputs still have an observable status.
-        if not outputs:
-            if status == "failed":
-                category = "scheduler_operation_failed"
-                comment = "The MemRead scheduler operation failed while processing this memory."
-            elif operation_name == "archive_merged_memories":
-                category = "memory_archival"
-                comment = f"Apply {operation_name} to a persisted memory unit."
-            elif operation_name in {"remove_memories", "remove_source_memories"}:
-                category = "memory_deletion"
-                comment = f"Apply {operation_name} to a persisted memory unit."
-            else:
-                category = "scheduler_operation_result"
-                comment = f"Produce the result of {operation_name} from its memory input."
-            result_value = self._scheduler_result_value(
-                hook_context,
-                operation_name=operation_name,
-                status=status,
-            )
-            outputs.append(result_value)
-            links.extend(
-                TraceLink(
-                    source=value,
-                    target=result_value,
-                    category=category,
-                    comment=comment,
-                )
-                for value in inputs
-            )
-
-        metadata = {
-            "memos_stage": f"{source}.{status}",
-            "handler": "mem_read",
-            "operation_name": operation_name,
-            "operation": operation,
-            "target": target,
-            "status": status,
-        }
-        if operation_name == "fine_transfer_simple_mem":
-            metadata["result_grouping"] = operation_input.get("result_grouping", "unknown")
-            if status == "after" and any(value.category == "enhanced_memory" for value in outputs):
-                metadata["lineage_status"] = "resolved" if links else "unresolved"
-        elif operation_name == "add_enhanced_memories" and status == "after":
-            metadata["lineage_status"] = lineage
-        if status == "failed":
-            # Record only the exception type; messages can expose business data.
-            metadata["error_type"] = type(error).__name__
-        self._emit(
-            self._event(
-                subject,
-                operation=f"memos.{source}.{status}",
-                category="scheduler_memory_operation",
-                inputs=self._unique_values(inputs),
-                outputs=self._unique_values(outputs),
-                links=tuple(links),
-                metadata=metadata,
-            )
-        )

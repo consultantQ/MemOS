@@ -1,6 +1,6 @@
 # SmartComment 集成优化说明
 
-基线：`feat/smartcomment-integration` 分支的 `e80b7ced`。本文仅记录在该版本之上的修改，不重复介绍基线已有的 Hook 和插件功能。
+基线：`feat/smartcomment-integration` 分支的 `e80b7ced`。第 1–6 节记录已提交的首轮优化 `305e3ea7`；第 7 节记录随后按 TODO 清单进行的整理。本文不重复介绍基线已有的 Hook 和插件功能。
 
 ## 1. 修改范围
 
@@ -77,3 +77,21 @@
 ## 6. 提交范围
 
 提交内容为上述插件清理、Hook 测试优化、文档及本说明。插件目录下本地维护的 `tests/`、`tmp/` 和日志继续被 Git 忽略，不纳入提交。通用 Hook 与独立插件仍按两个上游 PR 的定位准备，不在本轮重新划分基线已有提交。
+
+## 7. Trace 说明与代码布局整理（基于 `305e3ea7`）
+
+| TODO | 本轮处理 |
+| --- | --- |
+| 1. 字段命名与说明 | 保留 category、class_name、operation 和 identity 取值；新增 `TraceEvent.comment`，让操作/session 展示业务说明；补齐显式连线说明，澄清写入返回、搜索过滤、桶内排名、归档与删除的观测边界。 |
+| 2. 历史兼容 | 删除 `recorder._normalize_memory_units()` 的旧图格式迁移。当前格式恢复、ID 占位补全、首个完整快照及缓存淘汰后的续写保留。 |
+| 3. 冗余字段 | 删除未被读取或导出的 `TraceValue.name` 及构造参数；导出图的 `name` 仍由 identity 生成。 |
+| 4. 可读性 | 为规范化 Search 候选增加一个内部 `_SearchItem` TypedDict。保留多个真实入口共用的记忆展开函数，不改来源匹配算法。 |
+| 5. 代码布局 | Add 的调度处理紧接调度回调；Search 的共用流程紧接阶段回调，缓存清理归入关联状态；Adapter 集中生命周期方法。加简短功能分组注释，不新建模块。 |
+
+修改集中在 `events.py`、`handlers/base.py`、`handlers/add_handler.py`、`handlers/search_handler.py`、`recorder.py`、`adapter.py`，同步更新 README 和 CONVENTIONS。MemOS 核心、仓库原有测试、Hook 测试、MemTrace、依赖及锁文件均未改动。
+
+本轮不是完整输出逐字等价：图中的 comment 有意更新，`TraceValue` 构造不再接受 name，不再自动迁移历史图；来源关系、节点身份、分类、业务值和现有调用点的处理规则保持不变。持久化节点已有完整快照时不会只为更新说明而覆盖历史 comment。历史 split-version/无 snapshot_status 图应放在独立目录，不继续追加。
+
+验证：修改前插件回归 **31 passed**；修改后 **33 passed**，包括真实 SmartComment 图导出/读回、当前快照恢复及占位补全、说明传递、缓存恢复和失败恢复。相关 MemOS 离线回归 **266 passed, 1 skipped**（原有 skip），数据库/LLM 边界仍使用替身。插件测试仍只在本地维护。未重新部署完整 MemOS；此前全量测试的 Ollama 环境限制不变。
+
+Hook/Reader 定点回归 **49 passed**（与上述离线集合重叠）；改动文件的 pre-commit、两套 Ruff 配置检查/格式检查及 `git diff --check` 通过。Adapter 所有方法的语法树与基线一致，仅顺序和注释变化。

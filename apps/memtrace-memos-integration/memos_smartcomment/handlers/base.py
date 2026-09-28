@@ -18,6 +18,7 @@ logger = get_logger(__name__)
 _MISSING_TRACE = object()
 
 
+# Context adapters: resolve current Hook/request shapes without borrowing an empty trace.
 def _get(value: Any, name: str, default: Any | None = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
@@ -80,14 +81,13 @@ class BaseHandler:
         self._submit = submit
         self._max_value_chars = max_value_chars
 
-    # Snapshot synchronously so the worker cannot observe later business mutations.
+    # Detached values and events: capture business data before handing it to the worker.
     def _snapshot(self, value: Any) -> Any:
         return to_jsonable(value, max_value_chars=self._max_value_chars)
 
     def _value(
         self,
         *,
-        name: str,
         value: Any,
         identity: str,
         category: str,
@@ -97,7 +97,6 @@ class BaseHandler:
         metadata: dict[str, Any] | None = None,
     ) -> TraceValue:
         return TraceValue(
-            name=name,
             value=self._snapshot(value),
             identity=identity,
             category=category,
@@ -113,6 +112,7 @@ class BaseHandler:
         *,
         operation: str,
         category: str,
+        comment: str,
         inputs: tuple[TraceValue, ...] = (),
         outputs: tuple[TraceValue, ...] = (),
         links: tuple[TraceLink, ...] = (),
@@ -124,6 +124,7 @@ class BaseHandler:
         return TraceEvent(
             operation=operation,
             category=category,
+            comment=comment,
             trace_id=_current_trace_id(subject),
             session_id=_get(subject, "session_id"),
             task_id=_get(subject, "task_id"),
@@ -142,7 +143,7 @@ class BaseHandler:
         except Exception:
             logger.exception("Failed to enqueue smartcomment event: %s", event.operation)
 
-    # Here user_name identifies the storage cube, not the user.
+    # Hook correlation: user_name identifies the storage cube, not the user.
     @staticmethod
     def _hook_subject(context: Any, *, user_name: Any | None = None) -> dict[str, Any]:
         subject = {
@@ -165,16 +166,19 @@ class BaseHandler:
             subject.setdefault("cube_id", user_name)
         return subject
 
+    # Shared terminal nodes and identity-preserving deduplication.
     def _operation_status_value(self, subject: Any, *, stage: str) -> TraceValue:
         operation_id = _get(subject, "operation_id") or _current_trace_id(subject)
         return self._value(
-            name="operation_status",
             value="failed",
             identity=f"operation_status:{operation_id}:{stage}",
             category="operation_status",
             class_name="str",
             identity_only=False,
-            comment=f"MemOS operation failed at stage {stage}.",
+            comment=(
+                f"An exception reached the {stage} Hook boundary; "
+                "this status does not imply rollback of earlier side effects."
+            ),
             metadata={"memos_stage": stage, "status": "failed"},
         )
 

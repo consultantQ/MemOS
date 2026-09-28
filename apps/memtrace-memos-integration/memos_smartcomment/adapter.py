@@ -89,6 +89,7 @@ class AsyncTraceAdapter:
         self._state_lock = threading.Lock()
         self._stats = AdapterStats()
 
+    # Request-facing lifecycle: bounded, non-blocking submission and explicit drain/close.
     @property
     def stats(self) -> AdapterStats:
         with self._state_lock:
@@ -125,6 +126,32 @@ class AsyncTraceAdapter:
         logger.warning("Dropping smartcomment event because the queue is full: %s", event.operation)
         return False
 
+    # A successful flush means tasks finished; stats.failed reports failed writes.
+    def flush(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._queue.all_tasks_done.wait(remaining)
+        return True
+
+    # Drain accepted events; a timeout warns without interrupting an active write.
+    def close(self, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._state_lock:
+            self._closed = True
+            # Accepted events must drain even if start() was never called.
+            if not self._started and not self._queue.empty():
+                self._start_worker()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+            if thread.is_alive():
+                logger.warning("smartcomment writer did not stop within %.1f seconds", timeout)
+
+    # Worker-owned persistence: restore durable snapshots and atomically replace them.
     def output_path(self, trace_id: str, user_id: str | None = None) -> Path:
         user_part = _safe_path_component(user_id, "anonymous")
         trace_part = _safe_path_component(trace_id, "trace")
@@ -152,6 +179,7 @@ class AsyncTraceAdapter:
         data = exported.get("data", {})
         return sum(len(data.get(key, ())) for key in ("nodes", "edges", "operations", "sessions"))
 
+    # Worker-owned cache: keep only durable graphs and evict within configured limits.
     # Evict the least recently used graph until all limits are satisfied.
     def _trim_cache(self) -> None:
         now = time.monotonic()
@@ -209,28 +237,3 @@ class AsyncTraceAdapter:
         finally:
             self._recorders.clear()
             self._cached_graph_items = 0
-
-    # A successful flush means tasks finished; stats.failed reports failed writes.
-    def flush(self, timeout: float = 5.0) -> bool:
-        deadline = time.monotonic() + timeout
-        with self._queue.all_tasks_done:
-            while self._queue.unfinished_tasks:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._queue.all_tasks_done.wait(remaining)
-        return True
-
-    # Drain accepted events; a timeout warns without interrupting an active write.
-    def close(self, timeout: float = 5.0) -> None:
-        deadline = time.monotonic() + timeout
-        with self._state_lock:
-            self._closed = True
-            # Accepted events must drain even if start() was never called.
-            if not self._started and not self._queue.empty():
-                self._start_worker()
-            thread = self._thread
-        if thread is not None:
-            thread.join(timeout=max(0, deadline - time.monotonic()))
-            if thread.is_alive():
-                logger.warning("smartcomment writer did not stop within %.1f seconds", timeout)

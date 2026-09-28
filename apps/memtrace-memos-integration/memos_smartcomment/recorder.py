@@ -54,6 +54,7 @@ class SmartCommentRecorder:
             strict=settings.strict,
         )
 
+    # Event recording: register explicit values and dependencies, never an input/output product.
     @staticmethod
     def _as_comment_item(value: TraceValue) -> tuple[Any, dict[str, Any]]:
         options: dict[str, Any] = {
@@ -123,13 +124,21 @@ class SmartCommentRecorder:
                 session_id=f"event-{event.event_id}",
                 session_name=event.operation,
                 category=event.category,
-                comment=f"MemOS event for {event.operation}.",
+                comment=(
+                    event.comment
+                    if event.comment is not None
+                    else f"MemOS event for {event.operation}."
+                ),
                 metadata=session_metadata,
             ),
             self._comment_op_scope(
                 op_name=event.operation,
                 category=event.category,
-                comment=f"MemOS semantic operation: {event.operation}.",
+                comment=(
+                    event.comment
+                    if event.comment is not None
+                    else f"MemOS semantic operation: {event.operation}."
+                ),
                 metadata=operation_metadata,
             ),
         ):
@@ -147,6 +156,7 @@ class SmartCommentRecorder:
         if completions:
             self._complete_memory_snapshots(completions)
 
+    # Current-format snapshots: complete references once, restore, and export for persistence.
     def _complete_memory_snapshots(self, completions: dict[str, TraceValue]) -> None:
         """Fill an ID-only placeholder once, preserving its node ID and incident edges."""
         exported = self._graph.export_graph()
@@ -163,67 +173,15 @@ class SmartCommentRecorder:
         self.restore_graph(exported)
 
     def restore_graph(self, data: dict[str, Any]) -> None:
+        """Restore a current-format snapshot without changing its identities or edges."""
         from smartcomment.runtime import ExecNetwork
 
         for field in ("graph_id", "user_id", "project_id"):
             if data.get(field) != getattr(self._graph, field):
                 raise MemOSError(f"Snapshot {field} does not match the requested graph")
-        graph = ExecNetwork.import_graph(self._normalize_memory_units(data))
+        graph = ExecNetwork.import_graph(data)
         graph.strict = self._graph.strict
         self._graph = graph
-
-    @staticmethod
-    def _normalize_memory_units(data: dict[str, Any]) -> dict[str, Any]:
-        """Reconnect legacy versions to the earliest anchor and first complete snapshot."""
-        graph_data = data["data"]
-        anchors: dict[tuple[str | None, str], dict[str, Any]] = {}
-        aliases: dict[str, str] = {}
-        units = [node for node in graph_data["nodes"] if node["category"] == "persisted_memory"]
-        for node in sorted(units, key=lambda node: node["version"]):
-            metadata = dict(node.get("metadata", {}))
-            if "snapshot_status" not in metadata:
-                is_reference = "memory_id" in metadata and _decode(node["value"]) == {
-                    "memory_id": metadata["memory_id"],
-                    "cube_id": metadata.get("cube_id"),
-                }
-                metadata["snapshot_status"] = "reference" if is_reference else "complete"
-            # Exported names carry the identity supplied by id_strategy.
-            key = (node.get("class_name"), node["name"])
-            if key not in anchors:
-                anchors[key] = {**node, "metadata": metadata}
-            anchor = anchors[key]
-            aliases[node["full_node_id"]] = anchor["full_node_id"]
-            if (
-                anchor["metadata"]["snapshot_status"] == "reference"
-                and metadata["snapshot_status"] == "complete"
-            ):
-                anchor.update(value=node["value"], comment=node.get("comment"), metadata=metadata)
-
-        nodes = []
-        for node in graph_data["nodes"]:
-            if node["category"] != "persisted_memory":
-                nodes.append(node)
-            elif aliases[node["full_node_id"]] == node["full_node_id"]:
-                nodes.append(anchors[(node.get("class_name"), node["name"])])
-        return {
-            **data,
-            "data": {
-                **graph_data,
-                "nodes": nodes,
-                "edges": [
-                    {
-                        **edge,
-                        "source_full_node_id": aliases.get(
-                            edge["source_full_node_id"], edge["source_full_node_id"]
-                        ),
-                        "target_full_node_id": aliases.get(
-                            edge["target_full_node_id"], edge["target_full_node_id"]
-                        ),
-                    }
-                    for edge in graph_data["edges"]
-                ],
-            },
-        }
 
     # Hide SmartComment's internal NONE sentinel and its associated graph elements.
     def export_graph(self) -> dict[str, Any]:
