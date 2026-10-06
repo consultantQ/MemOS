@@ -182,7 +182,7 @@ class SearchHandler(BaseHandler):
             hook_context=hook_context,
             operation="memos.search.rerank",
             category="memory_reranking",
-            comment="Observe candidate order and content after the Search API rerank stage.",
+            comment="Observe candidate order and content after rerank stage.",
             stage="rerank",
             previous_stage="dedup",
             metadata={
@@ -206,7 +206,7 @@ class SearchHandler(BaseHandler):
         stage = "search.post_process.failed"
         subject = self._search_subject(hook_context, search_req)
         query = self._search_query_value(subject, search_req, identity_only=True)
-        status = self._operation_status_value(subject, stage=stage)
+        status = self._operation_status_value(subject, error, stage=stage)
         self._emit(
             self._event(
                 subject,
@@ -279,7 +279,7 @@ class SearchHandler(BaseHandler):
                     source=query,
                     target=node,
                     category="memory_retrieval",
-                    comment="This query returned the target memory candidate in raw search results.",
+                    comment="Return memory candidates in raw search results.",
                 )
                 for node in current_nodes
             )
@@ -298,8 +298,7 @@ class SearchHandler(BaseHandler):
                             target=candidate,
                             category=_SEARCH_LINK_CATEGORIES[stage],
                             comment=(
-                                f"Match the same candidate before and after search stage={stage}; "
-                                "the target records this stage's content, score, and rank."
+                                f"Match the same candidate before and after search stage={stage}."
                             ),
                         )
                     )
@@ -313,10 +312,7 @@ class SearchHandler(BaseHandler):
                         source=replace(node, identity_only=True),
                         target=filtered,
                         category="memory_filtered",
-                        comment=(
-                            f"This candidate is absent after search stage={stage}; "
-                            "no deletion from memory storage is implied."
-                        ),
+                        comment=(f"This candidate is absent after search stage={stage}."),
                     )
                     for node in removed_nodes
                 )
@@ -510,10 +506,7 @@ class SearchHandler(BaseHandler):
             category="search_filter_result",
             class_name="str",
             identity_only=False,
-            comment=(
-                f"Previous-stage candidates no longer present after search stage={stage}; "
-                "this status does not mean deletion from memory storage."
-            ),
+            comment=(f"Previous-stage candidates no longer present after search stage={stage}."),
             metadata={"stage": stage, "status": "filtered"},
         )
 

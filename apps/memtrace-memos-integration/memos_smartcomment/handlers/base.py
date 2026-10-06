@@ -167,7 +167,9 @@ class BaseHandler:
         return subject
 
     # Shared terminal nodes and identity-preserving deduplication.
-    def _operation_status_value(self, subject: Any, *, stage: str) -> TraceValue:
+    def _operation_status_value(
+        self, subject: Any, error: BaseException, *, stage: str
+    ) -> TraceValue:
         operation_id = _get(subject, "operation_id") or _current_trace_id(subject)
         return self._value(
             value="failed",
@@ -175,10 +177,7 @@ class BaseHandler:
             category="operation_status",
             class_name="str",
             identity_only=False,
-            comment=(
-                f"An exception reached the {stage} Hook boundary; "
-                "this status does not imply rollback of earlier side effects."
-            ),
+            comment=(f"An exception reached the {stage} Hook boundary: {error!s}."),
             metadata={"memos_stage": stage, "status": "failed"},
         )
 

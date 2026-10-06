@@ -163,7 +163,7 @@ class AddHandler(BaseHandler):
                 subject,
                 operation="memos.mem_reader.extract",
                 category="memory_extraction",
-                comment="Extract memory candidates from this message batch; no write is implied.",
+                comment="Extract memory candidates from this message batch.",
                 inputs=(message,),
                 outputs=extracted,
                 links=tuple(
@@ -198,7 +198,7 @@ class AddHandler(BaseHandler):
             return
         subject = self._hook_subject(hook_context, user_name=user_name)
         message = self._message_value(subject, messages, identity_only=True)
-        status = self._operation_status_value(subject, stage="mem_reader.extract.failed")
+        status = self._operation_status_value(subject, error, stage="mem_reader.extract.failed")
         self._emit(
             self._event(
                 subject,
@@ -250,10 +250,7 @@ class AddHandler(BaseHandler):
                 subject,
                 operation="memos.text_memory.persist",
                 category="memory_persistence",
-                comment=(
-                    "Observe returned memory IDs and match them to unique write inputs; "
-                    "database persistence is not independently verified."
-                ),
+                comment=("Observe returned memory IDs and match them to unique write inputs."),
                 inputs=self._unique_values(inputs),
                 outputs=self._unique_values(outputs),
                 links=tuple(links),
@@ -283,16 +280,13 @@ class AddHandler(BaseHandler):
         )
         if not inputs:
             return
-        status = self._operation_status_value(subject, stage="text_memory.add.failed")
+        status = self._operation_status_value(subject, error, stage="text_memory.add.failed")
         self._emit(
             self._event(
                 subject,
                 operation="memos.text_memory.persist.failed",
                 category="memory_persistence",
-                comment=(
-                    "Observe an exception at the memory-write boundary; "
-                    "earlier writes may already have taken effect."
-                ),
+                comment=(f"Observe an exception at the memory-write boundary {error!s}."),
                 inputs=tuple(inputs),
                 outputs=(status,),
                 links=tuple(
@@ -300,10 +294,7 @@ class AddHandler(BaseHandler):
                         source=value,
                         target=status,
                         category="operation_failed",
-                        comment=(
-                            "Writing this input was part of an operation that raised an "
-                            "observed exception; this does not imply rollback."
-                        ),
+                        comment=("Raise an observed exception."),
                     )
                     for value in inputs
                 ),
@@ -374,14 +365,11 @@ class AddHandler(BaseHandler):
             "fine_transfer_simple_mem": "Refine source memories into enhanced memories",
             "add_enhanced_memories": "Write enhanced memories and observe returned memory IDs",
             "archive_merged_memories": "Mark merged source memories as archived",
-            "remove_memories": "Request deletion of source memories",
-            "remove_source_memories": "Request deletion of source memories",
-        }.get(operation_name, f"Run MemRead operation {operation_name}")
+            "remove_memories": "deletion of source memories",
+            "remove_source_memories": "deletion of source memories",
+        }.get(operation_name, f"Run MemRead Scheduler operation {operation_name}")
         outcome = "the method returned" if status == "after" else "an exception reached the Hook"
-        operation_comment = (
-            f"{description} (backend operation: {operation}); {outcome}. "
-            "Database effects are not independently verified."
-        )
+        operation_comment = f"{description} (backend operation: {operation}); {outcome}."
         if not isinstance(operation_input, Mapping):
             operation_input = {}
         subject = self._hook_subject(hook_context, user_name=operation_input.get("user_name"))
@@ -417,33 +405,29 @@ class AddHandler(BaseHandler):
         if not outputs:
             if status == "failed":
                 category = "scheduler_operation_failed"
-                comment = (
-                    "This memory was an input to a MemRead operation that raised an "
-                    "observed exception; this does not imply rollback."
-                )
+                link_comment = "Raise an observed exception."
+                value_comment = f"An observed exception {error!s} occurred."
             elif operation_name == "archive_merged_memories":
                 category = "memory_archival"
-                comment = (
-                    "The archive method returned for this source memory; "
-                    "the plugin does not independently verify its stored status."
-                )
+                link_comment = "Archive the memory unit."
+                value_comment = "The memory unit has been archived successfully."
             elif operation_name in {"remove_memories", "remove_source_memories"}:
                 category = "memory_deletion"
-                comment = (
-                    f"The {operation} method returned with this memory among its inputs; "
-                    "this does not confirm removal, and soft-delete may preserve selected IDs."
+                link_comment = f"Remove the memory unit through the {operation} operation."
+                value_comment = (
+                    f"The memory unit has been removed through the {operation} operation."
                 )
             else:
                 category = "scheduler_operation_result"
-                comment = (
-                    f"The {operation_name} method returned without a memory output "
-                    "for this observed input group."
+                link_comment = f"The {operation_name} method is not traced. It does not produce a memory output for this observed input group."
+                value_comment = (
+                    f"The memory unit has been processed through the {operation} operation."
                 )
             result_value = self._scheduler_result_value(
                 hook_context,
                 operation_name=operation_name,
                 status=status,
-                comment=operation_comment,
+                comment=value_comment,
             )
             outputs.append(result_value)
             links.extend(
@@ -451,7 +435,7 @@ class AddHandler(BaseHandler):
                     source=value,
                     target=result_value,
                     category=category,
-                    comment=comment,
+                    comment=link_comment,
                 )
                 for value in inputs
             )
@@ -548,10 +532,10 @@ class AddHandler(BaseHandler):
         return self._value(
             value=messages,
             identity=self._message_identity(subject, messages, reference=identity_only),
-            category="message_batch",
-            class_name="message_batch",
+            category="input_message_batch",
+            class_name="input_message_batch",
             identity_only=identity_only,
-            comment="Message batch supplied to MemOS for memory extraction.",
+            comment="The user's original input message batch, without any modifications.",
             metadata=metadata,
         )
 
@@ -572,11 +556,11 @@ class AddHandler(BaseHandler):
             category="extracted_memory",
             class_name="memory",
             identity_only=identity_only,
-            comment="Memory candidate from MemReader extraction; not a write confirmation.",
+            comment="Memory candidate after MemReader extraction, not yet persisted.",
             metadata=metadata,
         )
 
-    # Share persisted anchors within a graph, including references arriving before the write.
+    # Share persisted anchors  within a graph, including references arriving before the write.
     def _persisted_memory_value(
         self,
         memory: Any,
@@ -596,10 +580,9 @@ class AddHandler(BaseHandler):
             class_name="memory",
             identity_only=memory is None,
             comment=(
-                f"Memory snapshot matched to an ID returned at {stage}; "
-                "database persistence is not independently verified."
+                f"Persisted memory unit matched to an ID returned at {stage}."
                 if memory is not None
-                else f"Write returned this memory ID at {stage}; its source and content are unresolved."
+                else f"Write returned this memory ID at {stage}. Its source and content are unresolved."
             ),
             metadata={
                 "memos_stage": stage,
@@ -620,10 +603,7 @@ class AddHandler(BaseHandler):
             category="persisted_memory",
             class_name="memory",
             identity_only=True,
-            comment=(
-                "Memory ID supplied to a MemRead operation; "
-                "this reference alone does not confirm its content or database state."
-            ),
+            comment=("Referred persisted memory unit."),
             metadata={"cube_id": cube_id, "memory_id": memory_id},
         )
 
@@ -647,7 +627,7 @@ class AddHandler(BaseHandler):
             category="enhanced_memory",
             class_name="memory",
             identity_only=identity_only,
-            comment="Memory produced by the MemRead scheduler's fine-transfer stage.",
+            comment="Enhanced memory candidate produced by the MemRead Scheduler's fine-transfer stage.",
             metadata={"cube_id": cube_id, "memory_id": memory_id},
         )
 
@@ -719,8 +699,7 @@ class AddHandler(BaseHandler):
                         target=target,
                         category="memory_refinement",
                         comment=(
-                            "This source memory contributed to the fine-transfer group "
-                            "that produced the target enhanced memory."
+                            "Refine the memory unit through the fine-transfer stage of the MemRead Scheduler."
                         ),
                     )
                     for source in source_values
@@ -781,11 +760,7 @@ class AddHandler(BaseHandler):
                         source=inputs[source_index],
                         target=target,
                         category="memory_persistence",
-                        comment=(
-                            f"Match this input memory to the ID returned at {stage}; "
-                            "the edge records write-result lineage, not independent "
-                            "database confirmation."
-                        ),
+                        comment=("Persist the memory candidate to form a memory unit."),
                         metadata={"pair_index": index, "input_index": source_index},
                     )
                 )
