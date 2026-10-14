@@ -30,7 +30,7 @@ class SmartCommentSettings:
 
     output_dir: Path = Path(".memos/memtrace")
     queue_size: int = 1024
-    max_value_chars: int = 20_000
+    max_value_chars: float = 20_000
     # Enable SmartComment checks without changing immutable persisted-memory semantics.
     strict: bool = False
     project_id: str = "memos"
@@ -44,9 +44,11 @@ class SmartCommentSettings:
         return cls(
             output_dir=Path(os.getenv("MEMOS_SMARTCOMMENT_OUTPUT_DIR", ".memos/memtrace")),
             queue_size=_positive_int("MEMOS_SMARTCOMMENT_QUEUE_SIZE", 1024),
-            max_value_chars=_positive_int(
-                "MEMOS_SMARTCOMMENT_MAX_VALUE_CHARS",
-                20_000,
+            max_value_chars=float(
+                _positive_int(
+                    "MEMOS_SMARTCOMMENT_MAX_VALUE_CHARS",
+                    20_000,
+                )
             ),
             strict=_as_bool("MEMOS_SMARTCOMMENT_STRICT"),
             project_id=os.getenv("MEMOS_SMARTCOMMENT_PROJECT_ID", "memos"),

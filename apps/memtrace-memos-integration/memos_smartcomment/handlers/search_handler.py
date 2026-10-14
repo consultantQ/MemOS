@@ -64,7 +64,10 @@ class SearchHandler(BaseHandler):
         with self._search_stage_items_lock:
             self._search_stage_nodes.clear()
 
-    # Search Hooks in pipeline order; the failure Hook closes the same operation scope.
+    # Query intake and search identity
+    # A search starts with a query and the readable cubes from its request.
+    # Hook context and request fields place that query in a user trace and
+    # operation scope. Every result stage refers to the same query identity.
     def on_search_before(
         self,
         *,
@@ -87,6 +90,48 @@ class SearchHandler(BaseHandler):
             )
         )
 
+    def _search_subject(
+        self,
+        hook_context: HookContext | None,
+        request: Any,
+    ) -> dict[str, Any]:
+        subject = self._hook_subject(hook_context)
+        for key in ("trace_id", "user_id", "session_id", "task_id"):
+            if subject.get(key) is None and (value := _get(request, key)) is not None:
+                subject[key] = value
+        if cube_ids := _cube_ids(request):
+            subject["mem_cube_ids"] = cube_ids
+        return subject
+
+    @staticmethod
+    def _search_scope_id(subject: Any) -> str:
+        """Identify one search operation within a possibly shared trace."""
+        operation_id = _get(subject, "operation_id")
+        return str(operation_id) if operation_id is not None else _current_trace_id(subject)
+
+    def _search_query_value(
+        self,
+        subject: Any,
+        request: Any,
+        *,
+        identity_only: bool,
+    ) -> TraceValue:
+        search_scope_id = self._search_scope_id(subject)
+        return self._value(
+            value=_get(request, "query", ""),
+            identity=f"search_query:{search_scope_id}",
+            category="search_query",
+            class_name="str",
+            identity_only=identity_only,
+            comment="Query submitted to the MemOS Search API for memory retrieval.",
+            metadata={"memos_stage": "search.before"},
+        )
+
+    # Retrieved candidates
+    # Retrieval returns candidates grouped by memory type and storage cube.
+    # Each occurrence receives a snapshot with its content, score, and rank
+    # within that bucket. Stage and traversal position distinguish repeated
+    # occurrences, while the original candidate supplies its matching key.
     def on_search_memory_results(
         self,
         *,
@@ -194,46 +239,6 @@ class SearchHandler(BaseHandler):
             },
         )
 
-    def on_search_post_process_failed(
-        self,
-        *,
-        handler: Any,
-        search_req: Any,
-        error: BaseException,
-        hook_context: HookContext | None = None,
-        **_kwargs: Any,
-    ) -> None:
-        stage = "search.post_process.failed"
-        subject = self._search_subject(hook_context, search_req)
-        query = self._search_query_value(subject, search_req, identity_only=True)
-        status = self._operation_status_value(subject, error, stage=stage)
-        self._emit(
-            self._event(
-                subject,
-                operation=f"memos.{stage}",
-                category="search_failure",
-                comment="Observe an exception during Search API post-processing for this query.",
-                inputs=(query,),
-                outputs=(status,),
-                links=(
-                    TraceLink(
-                        source=query,
-                        target=status,
-                        category="operation_failed",
-                        comment="Post-processing this query raised an observed exception.",
-                    ),
-                ),
-                metadata={
-                    "memos_stage": stage,
-                    "status": "failed",
-                    "error_type": error.__class__.__name__,
-                    "handler": handler.__class__.__name__,
-                },
-            )
-        )
-        self._clear_search_stages(subject)
-
-    # Stage processing: build nodes, connect known sources, then publish and clean up.
     def _on_search_results(
         self,
         *,
@@ -269,7 +274,7 @@ class SearchHandler(BaseHandler):
             self._search_memory_value(subject, stage=stage, item=item) for item in current_items
         )
 
-        # Only the first stage links candidates to the query.
+        # Retrieval establishes the query-to-candidate links.
         if previous_stage is None:
             query = self._search_query_value(subject, request, identity_only=True)
             inputs = (query,)
@@ -297,12 +302,10 @@ class SearchHandler(BaseHandler):
                             source=replace(source, identity_only=True),
                             target=candidate,
                             category=_SEARCH_LINK_CATEGORIES[stage],
-                            comment=(
-                                f"Match the same candidate before and after search stage={stage}."
-                            ),
+                            comment=(f"Perform post-processing via the stage {stage}."),
                         )
                     )
-            # Keep unmatched candidates, but do not invent their provenance.
+            # Publish every current candidate, including newly appearing candidates.
             outputs = current_nodes
             if removed_nodes:
                 filtered = self._search_filter_result_value(subject, stage=stage)
@@ -312,7 +315,7 @@ class SearchHandler(BaseHandler):
                         source=replace(node, identity_only=True),
                         target=filtered,
                         category="memory_filtered",
-                        comment=(f"This candidate is absent after search stage={stage}."),
+                        comment=(f"Filter out this memory candidate via the stage {stage}."),
                     )
                     for node in removed_nodes
                 )
@@ -343,62 +346,6 @@ class SearchHandler(BaseHandler):
         if stage == "rerank":
             self._clear_search_stages(subject)
 
-    # Operation correlation: one trace may contain multiple independent searches.
-    def _search_subject(
-        self,
-        hook_context: HookContext | None,
-        request: Any,
-    ) -> dict[str, Any]:
-        subject = self._hook_subject(hook_context)
-        for key in ("trace_id", "user_id", "session_id", "task_id"):
-            if subject.get(key) is None and (value := _get(request, key)) is not None:
-                subject[key] = value
-        if cube_ids := _cube_ids(request):
-            subject["mem_cube_ids"] = cube_ids
-        return subject
-
-    @staticmethod
-    def _search_scope_id(subject: Any) -> str:
-        """Identify one search operation within a possibly shared trace."""
-        operation_id = _get(subject, "operation_id")
-        return str(operation_id) if operation_id is not None else _current_trace_id(subject)
-
-    def _search_stage_key(self, subject: Any, stage: str) -> tuple[str, str, str]:
-        return (
-            _current_trace_id(subject),
-            self._search_scope_id(subject),
-            stage,
-        )
-
-    def _clear_search_stages(self, subject: Any) -> None:
-        trace_id = _current_trace_id(subject)
-        search_scope_id = self._search_scope_id(subject)
-        with self._search_stage_items_lock:
-            for key in [
-                key for key in self._search_stage_nodes if key[:2] == (trace_id, search_scope_id)
-            ]:
-                del self._search_stage_nodes[key]
-
-    # Candidate snapshots: keep stage-local rank separate from cross-stage identity.
-    def _search_query_value(
-        self,
-        subject: Any,
-        request: Any,
-        *,
-        identity_only: bool,
-    ) -> TraceValue:
-        search_scope_id = self._search_scope_id(subject)
-        return self._value(
-            value=_get(request, "query", ""),
-            identity=f"search_query:{search_scope_id}",
-            category="search_query",
-            class_name="str",
-            identity_only=identity_only,
-            comment="Query submitted to the MemOS Search API for memory retrieval.",
-            metadata={"memos_stage": "search.before"},
-        )
-
-    # Flatten buckets while retaining bucket-local rank and traversal order.
     @staticmethod
     def _search_result_items(results: Any) -> list[_SearchItem]:
         if not isinstance(results, Mapping):
@@ -459,9 +406,8 @@ class SearchHandler(BaseHandler):
         cube_scope = cube_id if cube_id is not None else f"bucket-{bucket_index}"
         score = item["score"]
         comment_parts = [
-            f"Memory candidate observed at search stage={stage}",
-            f"rank={rank} within result-type/cube bucket {rank_scope} (1-based)",
-            f"global_position={global_position} is traversal order, not a cross-cube rank",
+            f"Memory candidate observed at search {stage} stage",
+            f"rank={rank} within result-type/cube bucket {rank_scope}",
         ]
         if score is not None:
             comment_parts.append(f"score={score}")
@@ -493,24 +439,21 @@ class SearchHandler(BaseHandler):
                 "score": score,
             },
         )
-
-        # Match using the original item, never the truncated snapshot.
+        # Derive the matching key from the original candidate content.
         return replace(node, match_key=self._search_memory_match_key(item))
 
-    # Removed candidates share one terminal node per stage.
-    def _search_filter_result_value(self, subject: Any, *, stage: str) -> TraceValue:
-        search_scope_id = self._search_scope_id(subject)
-        return self._value(
-            value="filtered",
-            identity=f"search_filter_result:{search_scope_id}:{stage}",
-            category="search_filter_result",
-            class_name="str",
-            identity_only=False,
-            comment=(f"Previous-stage candidates no longer present after search stage={stage}."),
-            metadata={"stage": stage, "status": "filtered"},
+    def _search_stage_key(self, subject: Any, stage: str) -> tuple[str, str, str]:
+        return (
+            _current_trace_id(subject),
+            self._search_scope_id(subject),
+            stage,
         )
 
-    # Cross-stage lineage: match by type/cube/ID or original text, consuming duplicates FIFO.
+    # Candidate continuity across stages
+    # Memory type, cube, and memory ID identify a candidate across stages;
+    # anonymous candidates use their original text. Repeated occurrences
+    # pair in arrival order. Previous occurrences left after matching share
+    # the current stage's filtering outcome.
     @staticmethod
     def _search_memory_match_key(value: _SearchItem) -> str:
         memory_id = value["memory_id"]
@@ -520,7 +463,6 @@ class SearchHandler(BaseHandler):
         raw = json.dumps([value["result_type"], cube_scope, identity], ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    # Consume duplicate candidates FIFO so each source matches at most once.
     def _match_search_nodes(
         self,
         previous_nodes: tuple[TraceValue, ...],
@@ -542,3 +484,67 @@ class SearchHandler(BaseHandler):
 
         removed = tuple(node for node in previous_nodes if node.identity not in matched_identities)
         return tuple(matched), removed
+
+    def _search_filter_result_value(self, subject: Any, *, stage: str) -> TraceValue:
+        search_scope_id = self._search_scope_id(subject)
+        return self._value(
+            value="filtered",
+            identity=f"search_filter_result:{search_scope_id}:{stage}",
+            category="search_filter_result",
+            class_name="str",
+            identity_only=False,
+            comment=(f"The retrieved memory candidate which is filtered out at the {stage} stage."),
+            metadata={"stage": stage, "status": "filtered"},
+        )
+
+    # Search completion
+    # Reranking completes the search result flow. A post-processing exception
+    # links the query to a failure status. Both outcomes release the cached
+    # candidate stages for that search operation.
+    def on_search_post_process_failed(
+        self,
+        *,
+        handler: Any,
+        search_req: Any,
+        error: BaseException,
+        hook_context: HookContext | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        stage = "search.post_process.failed"
+        subject = self._search_subject(hook_context, search_req)
+        query = self._search_query_value(subject, search_req, identity_only=True)
+        status = self._operation_status_value(subject, error, stage=stage)
+        self._emit(
+            self._event(
+                subject,
+                operation=f"memos.{stage}",
+                category="search_failure",
+                comment="Observe an exception during Search API post-processing for this query.",
+                inputs=(query,),
+                outputs=(status,),
+                links=(
+                    TraceLink(
+                        source=query,
+                        target=status,
+                        category="operation_failed",
+                        comment="Post-processing this query raised an observed exception.",
+                    ),
+                ),
+                metadata={
+                    "memos_stage": stage,
+                    "status": "failed",
+                    "error_type": error.__class__.__name__,
+                    "handler": handler.__class__.__name__,
+                },
+            )
+        )
+        self._clear_search_stages(subject)
+
+    def _clear_search_stages(self, subject: Any) -> None:
+        trace_id = _current_trace_id(subject)
+        search_scope_id = self._search_scope_id(subject)
+        with self._search_stage_items_lock:
+            for key in [
+                key for key in self._search_stage_nodes if key[:2] == (trace_id, search_scope_id)
+            ]:
+                del self._search_stage_nodes[key]

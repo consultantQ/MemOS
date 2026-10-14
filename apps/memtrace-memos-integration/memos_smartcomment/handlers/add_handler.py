@@ -28,13 +28,14 @@ if TYPE_CHECKING:
 _MEM_READ_SOURCE_PREFIX = "scheduler.mem_read."
 
 
-# Input adapters: preserve record order and only infer unambiguous cube ownership.
+# Memory records carry their storage cube through nested result groups.
+# A single target cube supplies the default ownership; record-level cube
+# fields identify memories returned from extraction, writes, and refinement.
 def _single_cube_id(subject: Any) -> str | None:
     cube_ids = _cube_ids(subject)
     return cube_ids[0] if len(cube_ids) == 1 else None
 
 
-# Walk ID-bearing memory records, carrying cube ownership through wrappers.
 def _walk_memory_records(
     value: Any, cube_id: str | None = None
 ) -> Iterator[tuple[Any, str | None, str]]:
@@ -85,7 +86,11 @@ class AddHandler(BaseHandler):
         with self._message_batches_lock:
             self._message_batches.clear()
 
-    # Synchronous add Hooks: messages -> extracted candidates -> observed write results.
+    # Message intake and batch correlation
+    # Each add request introduces a message batch shared by its target cubes.
+    # Extraction in each cube consumes a reference to that batch, so the resulting
+    # memories point back to the same input. The batch leaves the pending cache
+    # when all cubes consume it or the add request completes.
     def on_add_before(self, *, request: Any, **_kwargs: Any) -> None:
         if bool(_get(request, "is_feedback", False)):
             return
@@ -118,6 +123,67 @@ class AddHandler(BaseHandler):
         with self._message_batches_lock:
             self._message_batches.pop(key, None)
 
+    def _message_value(
+        self,
+        subject: Any,
+        messages: Any,
+        *,
+        identity_only: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> TraceValue:
+        return self._value(
+            value=messages,
+            identity=self._message_identity(subject, messages, reference=identity_only),
+            category="input_message_batch",
+            class_name="input_message_batch",
+            identity_only=identity_only,
+            comment="The user's original input message batch, without any modifications.",
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _message_batch_key(subject: Any, messages: Any) -> tuple[str, str | None, int]:
+        return _current_trace_id(subject), _get(subject, "user_id"), id(messages)
+
+    def _message_identity(self, subject: Any, messages: Any, *, reference: bool) -> str:
+        key = self._message_batch_key(subject, messages)
+        with self._message_batches_lock:
+            if reference:
+                batch = self._message_batches.get(key)
+                # Match the batch through the request that owns its message object.
+                if batch is not None and _get(batch.owner(), "messages") is messages:
+                    cubes = _cube_ids(subject)
+                    # Keep the batch until every target cube has consumed its reference.
+                    batch.pending_cubes.difference_update(cubes)
+                    if not cubes or not batch.pending_cubes:
+                        del self._message_batches[key]
+                    return batch.identity
+                self._message_batches.pop(key, None)
+            # Assign a new identity to each add and each standalone extraction.
+            identity = f"message_batch:{key[0]}:{uuid4().hex}"
+            if not reference:
+                owner: Callable[[], Any]
+                try:
+                    # Let the request owner control its lifetime.
+                    owner = weakref.ref(subject)
+                except TypeError:
+                    # Retain dict and namespace owners for the pending batch lifetime.
+                    def owner() -> Any:
+                        return subject
+
+                cubes = set(_cube_ids(subject)) or {str(_get(subject, "user_id", "unknown"))}
+                self._message_batches[key] = _MessageBatch(owner, identity, cubes)
+                self._message_batches.move_to_end(key)
+                # Evict the oldest batches when the pending cache reaches capacity.
+                while len(self._message_batches) > self._max_pending_adds:
+                    self._message_batches.popitem(last=False)
+            return identity
+
+    # Chat memory extraction
+    # MemReader turns a chat message batch into memory candidates for a storage
+    # cube. Each candidate links to its source batch and retains its identity
+    # for the write stage. An extraction exception links the batch to a failure
+    # status in the same trace.
     def on_mem_reader_extract_after(
         self,
         *,
@@ -227,7 +293,41 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # A successful Hook observes the method boundary, not an independent database check.
+    @staticmethod
+    def _messages_from_scene_data(scene_data: Any) -> Any:
+        if isinstance(scene_data, list | tuple) and len(scene_data) == 1:
+            messages = scene_data[0]
+            if isinstance(messages, list | tuple | str):
+                return messages
+        return scene_data
+
+    def _extracted_memory_value(
+        self,
+        subject: Any,
+        memory: Any,
+        *,
+        cube_id: str | None,
+        memory_id: str,
+        identity_only: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> TraceValue:
+        trace_id = _current_trace_id(subject)
+        return self._value(
+            value=_memory_text(memory),
+            identity=f"extracted_memory:{trace_id}:{cube_id or 'unknown'}:{memory_id}",
+            category="extracted_memory",
+            class_name="memory",
+            identity_only=identity_only,
+            comment="Memory candidate after MemReader extraction, not yet persisted.",
+            metadata=metadata,
+        )
+
+    # Memory persistence
+    # Writes turn extracted or enhanced candidates into stored memory units.
+    # Each returned ID is paired with its unique input candidate to establish
+    # the persistence link. Stored units use cube and memory IDs as a shared
+    # identity across writes and later scheduler operations. Write exceptions
+    # link the submitted candidates to a failure status.
     def on_text_memory_add_after(
         self,
         *,
@@ -263,7 +363,6 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # Failure does not imply rollback of writes already committed.
     def on_text_memory_add_failed(
         self,
         *,
@@ -307,7 +406,123 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # MemRead Hooks: dispatch observed background operations without repeating their work.
+    def _persistence_values(
+        self,
+        subject: Any,
+        memories: Any,
+        result: Any,
+        *,
+        cube_id: str | None,
+        enhanced: bool = False,
+    ) -> tuple[list[TraceValue], list[TraceValue], list[TraceLink]]:
+        records = list(_walk_memory_records(memories, cube_id))
+        result_ids = list(result) if isinstance(result, list | tuple) else []
+        inputs: list[TraceValue] = []
+        outputs: list[TraceValue] = []
+        links: list[TraceLink] = []
+        # Pair returned IDs with unique input candidates.
+        candidates: dict[str, list[int]] = defaultdict(list)
+        source_value = self._enhanced_memory_value if enhanced else self._extracted_memory_value
+        for source_index, (memory, record_cube, candidate_id) in enumerate(records):
+            resolved_cube = record_cube or cube_id
+            source = source_value(
+                subject,
+                memory,
+                cube_id=resolved_cube,
+                memory_id=candidate_id,
+                identity_only=True,
+            )
+            candidates[candidate_id].append(source_index)
+            inputs.append(source)
+
+        stage = (
+            "scheduler.mem_read.add_enhanced_memories.after"
+            if enhanced
+            else "text_memory.add.after"
+        )
+        for index, result_id in enumerate(result_ids):
+            memory_id = str(result_id)
+            matching = candidates.get(memory_id, [])
+            source_index = matching[0] if len(matching) == 1 else None
+            memory, record_cube, _ = (
+                records[source_index] if source_index is not None else (None, cube_id, memory_id)
+            )
+            target = self._persisted_memory_value(
+                memory,
+                cube_id=record_cube or cube_id,
+                memory_id=memory_id,
+                stage=stage,
+            )
+            outputs.append(target)
+            if source_index is not None:
+                links.append(
+                    TraceLink(
+                        source=inputs[source_index],
+                        target=target,
+                        category="memory_persistence",
+                        comment=("Persist the memory candidate to form a memory unit."),
+                        metadata={"pair_index": index, "input_index": source_index},
+                    )
+                )
+        return inputs, outputs, links
+
+    @staticmethod
+    def _persistence_lineage(outputs: list[TraceValue], links: list[TraceLink]) -> str:
+        if len(links) == len(outputs):
+            return "resolved"
+        return "partial" if links else "unresolved"
+
+    def _persisted_memory_value(
+        self,
+        memory: Any,
+        *,
+        cube_id: str | None,
+        memory_id: str,
+        stage: str = "text_memory.add.after",
+    ) -> TraceValue:
+        return self._value(
+            value=(
+                _memory_text(memory)
+                if memory is not None
+                else {"memory_id": memory_id, "cube_id": cube_id}
+            ),
+            identity=f"memory:{cube_id or 'unknown'}:{memory_id}",
+            category="persisted_memory",
+            class_name="memory",
+            identity_only=memory is None,
+            comment=(
+                f"Persisted memory unit matched to an ID returned at {stage}."
+                if memory is not None
+                else f"Write returned this memory ID at {stage}. Its source and content are unresolved."
+            ),
+            metadata={
+                "memos_stage": stage,
+                "cube_id": cube_id,
+                "memory_id": memory_id,
+            },
+        )
+
+    def _persisted_memory_reference(
+        self,
+        *,
+        cube_id: str | None,
+        memory_id: str,
+    ) -> TraceValue:
+        return self._value(
+            value={"memory_id": memory_id, "cube_id": cube_id},
+            identity=f"memory:{cube_id or 'unknown'}:{memory_id}",
+            category="persisted_memory",
+            class_name="memory",
+            identity_only=True,
+            comment=("Referred persisted memory unit."),
+            metadata={"cube_id": cube_id, "memory_id": memory_id},
+        )
+
+    # Background memory maintenance
+    # MemRead refines stored memories, writes enhanced candidates, and archives
+    # or removes source memories. The scheduler operation selects the relevant
+    # memory flow and records its inputs and outputs. Archival, deletion, and
+    # failures link the affected memories to an operation status.
     def on_scheduler_memory_operation_after(
         self,
         *,
@@ -356,7 +571,7 @@ class AddHandler(BaseHandler):
         status: str,
     ) -> None:
         source = str(_get(hook_context, "source", ""))
-        # Other handlers share this Hook; only interpret MemRead operations.
+        # MemRead sources identify the background maintenance flow.
         if not source.startswith(_MEM_READ_SOURCE_PREFIX):
             return
 
@@ -401,7 +616,7 @@ class AddHandler(BaseHandler):
                 cube_id=cube_id,
             )
 
-        # Operations without memory outputs still have an observable status.
+        # Represent completion and failure with a status when outputs are empty.
         if not outputs:
             if status == "failed":
                 category = "scheduler_operation_failed"
@@ -455,7 +670,7 @@ class AddHandler(BaseHandler):
         elif operation_name == "add_enhanced_memories" and status == "after":
             metadata["lineage_status"] = lineage
         if status == "failed":
-            # Record only the exception type; messages can expose business data.
+            # Classify the failure by exception type.
             metadata["error_type"] = type(error).__name__
         self._emit(
             self._event(
@@ -470,166 +685,27 @@ class AddHandler(BaseHandler):
             )
         )
 
-    # Message correlation: creation registers a batch; references consume one cube's claim.
-    @staticmethod
-    def _message_batch_key(subject: Any, messages: Any) -> tuple[str, str | None, int]:
-        return _current_trace_id(subject), _get(subject, "user_id"), id(messages)
-
-    def _message_identity(self, subject: Any, messages: Any, *, reference: bool) -> str:
-        key = self._message_batch_key(subject, messages)
-        with self._message_batches_lock:
-            if reference:
-                batch = self._message_batches.get(key)
-                # Validate the live owner, so an abandoned request cannot match a
-                # subsequently allocated list at the same address.
-                if batch is not None and _get(batch.owner(), "messages") is messages:
-                    cubes = _cube_ids(subject)
-                    # Keep the batch until every target cube has consumed its reference.
-                    batch.pending_cubes.difference_update(cubes)
-                    if not cubes or not batch.pending_cubes:
-                        del self._message_batches[key]
-                    return batch.identity
-                self._message_batches.pop(key, None)
-            # Each add gets a fresh identity; unmatched references never borrow another request's.
-            identity = f"message_batch:{key[0]}:{uuid4().hex}"
-            if not reference:
-                owner: Callable[[], Any]
-                try:
-                    # Do not keep abandoned requests alive.
-                    owner = weakref.ref(subject)
-                except TypeError:
-                    # Plain dict/namespace callers cannot be weakly referenced.
-                    # Their entries still have the same bounded, per-add lifetime.
-                    def owner() -> Any:
-                        return subject
-
-                cubes = set(_cube_ids(subject)) or {str(_get(subject, "user_id", "unknown"))}
-                self._message_batches[key] = _MessageBatch(owner, identity, cubes)
-                self._message_batches.move_to_end(key)
-                # Bound pending batches even if no completion Hook arrives.
-                while len(self._message_batches) > self._max_pending_adds:
-                    self._message_batches.popitem(last=False)
-            return identity
-
-    # Unwrap a single scene without copying the messages used for correlation.
-    @staticmethod
-    def _messages_from_scene_data(scene_data: Any) -> Any:
-        if isinstance(scene_data, list | tuple) and len(scene_data) == 1:
-            messages = scene_data[0]
-            if isinstance(messages, list | tuple | str):
-                return messages
-        return scene_data
-
-    # Node construction: identity selects the anchor; comment explains the captured value.
-    def _message_value(
+    def _scheduler_persisted_inputs(
         self,
-        subject: Any,
-        messages: Any,
-        *,
-        identity_only: bool,
-        metadata: dict[str, Any] | None = None,
-    ) -> TraceValue:
-        return self._value(
-            value=messages,
-            identity=self._message_identity(subject, messages, reference=identity_only),
-            category="input_message_batch",
-            class_name="input_message_batch",
-            identity_only=identity_only,
-            comment="The user's original input message batch, without any modifications.",
-            metadata=metadata,
-        )
-
-    def _extracted_memory_value(
-        self,
-        subject: Any,
-        memory: Any,
+        operation_name: str,
+        operation_input: Mapping[str, Any],
         *,
         cube_id: str | None,
-        memory_id: str,
-        identity_only: bool,
-        metadata: dict[str, Any] | None = None,
-    ) -> TraceValue:
-        trace_id = _current_trace_id(subject)
-        return self._value(
-            value=_memory_text(memory),
-            identity=f"extracted_memory:{trace_id}:{cube_id or 'unknown'}:{memory_id}",
-            category="extracted_memory",
-            class_name="memory",
-            identity_only=identity_only,
-            comment="Memory candidate after MemReader extraction, not yet persisted.",
-            metadata=metadata,
-        )
-
-    # Share persisted anchors  within a graph, including references arriving before the write.
-    def _persisted_memory_value(
-        self,
-        memory: Any,
-        *,
-        cube_id: str | None,
-        memory_id: str,
-        stage: str = "text_memory.add.after",
-    ) -> TraceValue:
-        return self._value(
-            value=(
-                _memory_text(memory)
-                if memory is not None
-                else {"memory_id": memory_id, "cube_id": cube_id}
-            ),
-            identity=f"memory:{cube_id or 'unknown'}:{memory_id}",
-            category="persisted_memory",
-            class_name="memory",
-            identity_only=memory is None,
-            comment=(
-                f"Persisted memory unit matched to an ID returned at {stage}."
-                if memory is not None
-                else f"Write returned this memory ID at {stage}. Its source and content are unresolved."
-            ),
-            metadata={
-                "memos_stage": stage,
-                "cube_id": cube_id,
-                "memory_id": memory_id,
-            },
-        )
-
-    def _persisted_memory_reference(
-        self,
-        *,
-        cube_id: str | None,
-        memory_id: str,
-    ) -> TraceValue:
-        return self._value(
-            value={"memory_id": memory_id, "cube_id": cube_id},
-            identity=f"memory:{cube_id or 'unknown'}:{memory_id}",
-            category="persisted_memory",
-            class_name="memory",
-            identity_only=True,
-            comment=("Referred persisted memory unit."),
-            metadata={"cube_id": cube_id, "memory_id": memory_id},
-        )
-
-    def _enhanced_memory_value(
-        self,
-        subject: Any,
-        memory: Any,
-        *,
-        cube_id: str | None,
-        memory_id: str,
-        identity_only: bool,
-    ) -> TraceValue:
-        value = (
-            {"memory_id": memory_id, "cube_id": cube_id} if identity_only else _memory_text(memory)
-        )
-        return self._value(
-            value=value,
-            identity=(
-                f"enhanced_memory:{_current_trace_id(subject)}:{cube_id or 'unknown'}:{memory_id}"
-            ),
-            category="enhanced_memory",
-            class_name="memory",
-            identity_only=identity_only,
-            comment="Enhanced memory candidate produced by the MemRead Scheduler's fine-transfer stage.",
-            metadata={"cube_id": cube_id, "memory_id": memory_id},
-        )
+    ) -> list[TraceValue]:
+        if operation_name == "fine_transfer_simple_mem":
+            records = _walk_memory_records(operation_input.get("memories"), cube_id)
+            return [
+                self._persisted_memory_reference(
+                    cube_id=record_cube or cube_id,
+                    memory_id=memory_id,
+                )
+                for _memory, record_cube, memory_id in records
+            ]
+        memory_ids = operation_input.get("memory_ids") or []
+        return [
+            self._persisted_memory_reference(cube_id=cube_id, memory_id=str(memory_id))
+            for memory_id in memory_ids
+        ]
 
     def _scheduler_result_value(
         self,
@@ -655,7 +731,12 @@ class AddHandler(BaseHandler):
             },
         )
 
-    # Lineage construction: connect only grouping- or ID-backed sources, never guess by position.
+    # Memory refinement
+    # Fine-transfer produces enhanced candidates from stored source memories.
+    # Per-input result groups link each source to its own candidates; batch
+    # results link the source group to every candidate. A single source owns
+    # all of its results. Enhanced identities carry these candidates into the
+    # subsequent persistence step.
     def _fine_transfer_values(
         self,
         subject: Any,
@@ -677,10 +758,11 @@ class AddHandler(BaseHandler):
                 ([source], group) for source, group in zip(inputs, result_groups, strict=True)
             ]
         # Batch grouping (or one source) gives every output all known inputs.
+        # TODO: Detailed link analysis for batch grouping
         elif grouping == "batch" or len(inputs) == 1:
             groups = [(inputs, result)]
         else:
-            # Keep unresolved outputs without guessing source edges.
+            # Unresolved groups produce standalone enhanced candidates.
             groups = [([], result)]
 
         for source_values, group in groups:
@@ -706,91 +788,26 @@ class AddHandler(BaseHandler):
                 )
         return inputs, outputs, links
 
-    def _persistence_values(
+    def _enhanced_memory_value(
         self,
         subject: Any,
-        memories: Any,
-        result: Any,
+        memory: Any,
         *,
         cube_id: str | None,
-        enhanced: bool = False,
-    ) -> tuple[list[TraceValue], list[TraceValue], list[TraceLink]]:
-        records = list(_walk_memory_records(memories, cube_id))
-        result_ids = list(result) if isinstance(result, list | tuple) else []
-        inputs: list[TraceValue] = []
-        outputs: list[TraceValue] = []
-        links: list[TraceLink] = []
-        # Only a unique input ID establishes lineage, regardless of returned ID order.
-        candidates: dict[str, list[int]] = defaultdict(list)
-        source_value = self._enhanced_memory_value if enhanced else self._extracted_memory_value
-        for source_index, (memory, record_cube, candidate_id) in enumerate(records):
-            resolved_cube = record_cube or cube_id
-            source = source_value(
-                subject,
-                memory,
-                cube_id=resolved_cube,
-                memory_id=candidate_id,
-                identity_only=True,
-            )
-            candidates[candidate_id].append(source_index)
-            inputs.append(source)
-
-        stage = (
-            "scheduler.mem_read.add_enhanced_memories.after"
-            if enhanced
-            else "text_memory.add.after"
+        memory_id: str,
+        identity_only: bool,
+    ) -> TraceValue:
+        value = (
+            {"memory_id": memory_id, "cube_id": cube_id} if identity_only else _memory_text(memory)
         )
-        for index, result_id in enumerate(result_ids):
-            memory_id = str(result_id)
-            matching = candidates.get(memory_id, [])
-            source_index = matching[0] if len(matching) == 1 else None
-            memory, record_cube, _ = (
-                records[source_index] if source_index is not None else (None, cube_id, memory_id)
-            )
-            target = self._persisted_memory_value(
-                memory,
-                cube_id=record_cube or cube_id,
-                memory_id=memory_id,
-                stage=stage,
-            )
-            outputs.append(target)
-            if source_index is not None:
-                links.append(
-                    TraceLink(
-                        source=inputs[source_index],
-                        target=target,
-                        category="memory_persistence",
-                        comment=("Persist the memory candidate to form a memory unit."),
-                        metadata={"pair_index": index, "input_index": source_index},
-                    )
-                )
-        return inputs, outputs, links
-
-    # No outputs means there is no unresolved lineage.
-    @staticmethod
-    def _persistence_lineage(outputs: list[TraceValue], links: list[TraceLink]) -> str:
-        if len(links) == len(outputs):
-            return "resolved"
-        return "partial" if links else "unresolved"
-
-    def _scheduler_persisted_inputs(
-        self,
-        operation_name: str,
-        operation_input: Mapping[str, Any],
-        *,
-        cube_id: str | None,
-    ) -> list[TraceValue]:
-        if operation_name == "fine_transfer_simple_mem":
-            records = _walk_memory_records(operation_input.get("memories"), cube_id)
-            return [
-                self._persisted_memory_reference(
-                    cube_id=record_cube or cube_id,
-                    memory_id=memory_id,
-                )
-                for _memory, record_cube, memory_id in records
-            ]
-        memory_ids = operation_input.get("memory_ids") or []
-        return [
-            self._persisted_memory_reference(cube_id=cube_id, memory_id=str(memory_id))
-            for memory_id in memory_ids
-        ]
+        return self._value(
+            value=value,
+            identity=(
+                f"enhanced_memory:{_current_trace_id(subject)}:{cube_id or 'unknown'}:{memory_id}"
+            ),
+            category="enhanced_memory",
+            class_name="memory",
+            identity_only=identity_only,
+            comment="Enhanced memory candidate produced by the MemRead Scheduler's fine-transfer stage.",
+            metadata={"cube_id": cube_id, "memory_id": memory_id},
+        )

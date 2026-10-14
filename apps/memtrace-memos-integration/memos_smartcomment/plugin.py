@@ -40,6 +40,7 @@ class SmartCommentPlugin(MemOSPlugin):
             self.adapter.submit,
             max_value_chars=settings.max_value_chars,
         )
+        # start the adapter, which will begin processing trace events asynchronously.
         self.adapter.start()
 
         for hook, callback in (
