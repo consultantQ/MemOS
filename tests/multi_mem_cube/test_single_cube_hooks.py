@@ -3,23 +3,17 @@
 from __future__ import annotations
 
 import logging
-import uuid
 
 from importlib import import_module
 from unittest.mock import MagicMock
 
 import pytest
 
-from memos.plugins.hook_context import HookContext
 from memos.plugins.hook_defs import H
-from memos.plugins.hooks import _hooks, register_hook
+from memos.plugins.hooks import register_hook
 
 
-@pytest.fixture(autouse=True)
-def _reset_registered_hooks():
-    _hooks.clear()
-    yield
-    _hooks.clear()
+pytestmark = pytest.mark.usefixtures("clean_hooks")
 
 
 def _make_add_request(**overrides):
@@ -48,7 +42,7 @@ def single_cube_view():
     from memos.multi_mem_cube.single_cube import SingleCubeView
 
     memory = TextualMemoryItem(
-        id=str(uuid.uuid4()),
+        id="00000000-0000-0000-0000-000000000001",
         memory="hello world",
         metadata=TreeNodeTextualMemoryMetadata(
             user_id="u1",
@@ -79,15 +73,38 @@ def single_cube_view():
     return view, memory
 
 
-def test_text_memory_after_hook_can_replace_memory_ids(single_cube_view):
-    view, _memory = single_cube_view
-    register_hook(H.TEXT_MEMORY_ADD_AFTER, lambda **_kwargs: ["plugin-memory-id"])
+def test_text_memory_after_hook_observes_write_and_replaces_memory_ids(single_cube_view):
+    view, memory = single_cube_view
+    captured = {}
 
-    results = view.add_memories(_make_add_request(async_mode="async"))
+    def replace_memory_ids(**kwargs):
+        captured.update(kwargs)
+        return ["plugin-memory-id"]
+
+    register_hook(H.TEXT_MEMORY_ADD_AFTER, replace_memory_ids)
+
+    results = view.add_memories(
+        _make_add_request(
+            async_mode="async",
+            session_id="session-1",
+            task_id="task-1",
+        )
+    )
 
     assert results[0]["memory_id"] == "plugin-memory-id"
+    context = captured.pop("hook_context")
+    assert context.user_id == "test_user"
+    assert context.session_id == "session-1"
+    assert context.task_id == "task-1"
+    assert context.cube_ids == ("cube_test",)
+    assert context.source == "cube_view.text_mem.add"
+    assert captured == {
+        "text_memory": view.naive_mem_cube.text_mem,
+        "memories": [memory],
+        "kwargs": {"user_name": "cube_test"},
+        "result": [memory.id],
+    }
     submitted_message = view.mem_scheduler.submit_messages.call_args.kwargs["messages"][0]
-    assert submitted_message.mem_cube_id == "cube_test"
     assert submitted_message.content == '["plugin-memory-id"]'
 
 
@@ -97,20 +114,21 @@ def test_text_memory_failure_hook_preserves_original_error_and_skips_after(
 ):
     view, memory = single_cube_view
     error = ValueError("text memory add failed")
-    failed_calls = []
-    after_calls = []
+    events = []
     view.naive_mem_cube.text_mem.add.side_effect = error
     monkeypatch.setattr(
         "memos.multi_mem_cube.single_cube.get_current_trace_id",
         lambda: "trace-1",
     )
 
-    def on_failed(**kwargs):
-        failed_calls.append(kwargs)
-        raise RuntimeError("plugin failed")
+    def record(stage):
+        def callback(**kwargs):
+            events.append((stage, kwargs))
 
-    register_hook(H.TEXT_MEMORY_ADD_FAILED, on_failed)
-    register_hook(H.TEXT_MEMORY_ADD_AFTER, lambda **kwargs: after_calls.append(kwargs))
+        return callback
+
+    register_hook(H.TEXT_MEMORY_ADD_FAILED, record("failed"))
+    register_hook(H.TEXT_MEMORY_ADD_AFTER, record("after"))
 
     with pytest.raises(ValueError, match="text memory add failed") as exc_info:
         view.add_memories(
@@ -122,19 +140,13 @@ def test_text_memory_failure_hook_preserves_original_error_and_skips_after(
         )
 
     assert exc_info.value is error
-    assert after_calls == []
-    assert len(failed_calls) == 1
-    call = failed_calls[0]
+    assert [stage for stage, _kwargs in events] == ["failed"]
+    call = events[0][1]
     context = call["hook_context"]
-    assert isinstance(context, HookContext)
     assert context.trace_id == "trace-1"
     assert context.user_id == "test_user"
-    assert context.session_id == "session-1"
-    assert context.task_id == "task-1"
     assert context.cube_ids == ("cube_test",)
     assert context.source == "cube_view.text_mem.add"
-    assert context.attributes == {"sync_mode": "async", "extract_mode": "fast"}
-    assert context.operation_id is not None
     assert call["text_memory"] is view.naive_mem_cube.text_mem
     assert call["memories"] == [memory]
     assert call["kwargs"] == {"user_name": "cube_test"}

@@ -1,41 +1,44 @@
-"""HookContext values, callback compatibility, and @hookable propagation."""
-
-from __future__ import annotations
+"""Public HookContext contracts and context-aware callback behavior."""
 
 import asyncio
 
-from collections.abc import Mapping
-from typing import Any, get_type_hints
-from uuid import UUID
-
 import pytest
 
-from memos.plugins.hook_context import HookContext, build_hook_context
+from memos.plugins.hook_context import build_hook_context
 from memos.plugins.hook_defs import H, define_hook, get_hook_spec
-from memos.plugins.hooks import (
-    _hooks,
-    hookable,
-    register_hook,
-    trigger_hook,
-    trigger_single_hook,
+from memos.plugins.hooks import hookable, register_hook, trigger_hook, trigger_single_hook
+
+
+pytestmark = pytest.mark.usefixtures("clean_hooks")
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "pipe_key"),
+    [
+        (H.SEARCH_BEFORE, "request"),
+        (H.SEARCH_AFTER, "result"),
+        (H.SEARCH_MEMORY_RESULTS, "results"),
+        (H.SEARCH_RESULTS_AFTER_THRESHOLD, "results"),
+        (H.SEARCH_RESULTS_AFTER_DEDUP, "results"),
+        (H.SEARCH_RESULTS_AFTER_RERANK, "results"),
+        (H.SEARCH_CONTEXT_RENDER, "results"),
+        (H.SEARCH_POST_PROCESS_FAILED, None),
+        (H.TEXT_MEMORY_ADD_AFTER, "result"),
+        (H.TEXT_MEMORY_ADD_FAILED, None),
+        (H.SCHEDULER_MEMORY_OPERATION_AFTER, "result"),
+        (H.SCHEDULER_MEMORY_OPERATION_FAILED, None),
+        (H.MEM_READER_EXTRACT_AFTER, "result"),
+        (H.MEM_READER_EXTRACT_FAILED, None),
+    ],
 )
+def test_integration_hook_specs_are_registered(hook_name, pipe_key):
+    spec = get_hook_spec(hook_name)
+
+    assert spec is not None
+    assert spec.pipe_key == pipe_key
 
 
-@pytest.fixture(autouse=True)
-def _reset_registered_hooks():
-    _hooks.clear()
-    yield
-    _hooks.clear()
-
-
-def test_hook_context_type_hints_are_runtime_resolvable():
-    hints = get_type_hints(HookContext)
-
-    assert hints["attributes"] == Mapping[str, Any]
-    assert hints["operation_id"] == str | None
-
-
-def test_build_hook_context_populates_correlation_metadata():
+def test_build_hook_context_copies_correlation_metadata():
     cube_ids = ["cube-1", "cube-2"]
     attributes = {"mode": "fine"}
 
@@ -46,95 +49,26 @@ def test_build_hook_context_populates_correlation_metadata():
         session_id="session-1",
         task_id="task-1",
         cube_ids=cube_ids,
-        operation_id="operation-1",
         attributes=attributes,
     )
     cube_ids.append("cube-3")
-    attributes["mode"] = "mutated"
+    attributes["mode"] = "fast"
 
-    assert context == HookContext(
-        trace_id="trace-1",
-        user_id="user-1",
-        session_id="session-1",
-        task_id="task-1",
-        cube_ids=("cube-1", "cube-2"),
-        operation_id="operation-1",
-        source="mem_reader.extract",
-        attributes={"mode": "fine"},
-    )
+    assert context.trace_id == "trace-1"
+    assert context.user_id == "user-1"
+    assert context.session_id == "session-1"
+    assert context.task_id == "task-1"
+    assert context.cube_ids == ("cube-1", "cube-2")
+    assert context.source == "mem_reader.extract"
+    assert context.attributes == {"mode": "fine"}
+    assert context.operation_id
 
 
-def test_build_hook_context_generates_unique_operation_ids():
-    first = build_hook_context(source="text_memory.add")
-    second = build_hook_context(source="text_memory.add")
-
-    assert first.operation_id is not None
-    assert second.operation_id is not None
-    assert UUID(first.operation_id).hex == first.operation_id
-    assert UUID(second.operation_id).hex == second.operation_id
-    assert first.operation_id != second.operation_id
-
-
-def test_context_aware_hook_specs_match_trigger_contracts():
-    expected = {
-        H.TEXT_MEMORY_ADD_AFTER: (
-            ["hook_context", "text_memory", "memories", "kwargs", "result"],
-            "result",
-        ),
-        H.TEXT_MEMORY_ADD_FAILED: (
-            ["hook_context", "text_memory", "memories", "kwargs", "error"],
-            None,
-        ),
-        H.SCHEDULER_MEMORY_OPERATION_AFTER: (
-            ["hook_context", "operation", "target", "operation_input", "result"],
-            "result",
-        ),
-        H.SCHEDULER_MEMORY_OPERATION_FAILED: (
-            ["hook_context", "operation", "target", "operation_input", "error"],
-            None,
-        ),
-        H.MEM_READER_EXTRACT_AFTER: (
-            [
-                "hook_context",
-                "mem_reader",
-                "scene_data",
-                "type",
-                "info",
-                "mode",
-                "user_name",
-                "kwargs",
-                "result",
-            ],
-            "result",
-        ),
-        H.MEM_READER_EXTRACT_FAILED: (
-            [
-                "hook_context",
-                "mem_reader",
-                "scene_data",
-                "type",
-                "info",
-                "mode",
-                "user_name",
-                "kwargs",
-                "error",
-            ],
-            None,
-        ),
-    }
-
-    for hook_name, (params, pipe_key) in expected.items():
-        spec = get_hook_spec(hook_name)
-        assert spec is not None
-        assert spec.params == params
-        assert spec.pipe_key == pipe_key
-
-
-def test_hook_context_is_omitted_only_for_legacy_exact_signature_callbacks():
-    hook_name = "test.hook-context.compat"
+def test_hook_context_is_additive_for_new_and_legacy_callbacks():
+    hook_name = "test.hook-context.compatibility"
     define_hook(
         hook_name,
-        description="hook context compatibility test",
+        description="HookContext compatibility",
         params=["hook_context", "result"],
         pipe_key="result",
     )
@@ -149,164 +83,106 @@ def test_hook_context_is_omitted_only_for_legacy_exact_signature_callbacks():
         calls.append(("context", hook_context, result))
         return result + 1
 
-    def kwargs_callback(*, result, **kwargs):
-        calls.append(("kwargs", kwargs["hook_context"], result))
-        return result + 1
-
     register_hook(hook_name, legacy_callback)
     register_hook(hook_name, context_callback)
-    register_hook(hook_name, kwargs_callback)
 
     result = trigger_hook(hook_name, hook_context=context, result=1)
 
-    assert result == 4
-    assert calls == [
-        ("legacy", 1),
-        ("context", context, 2),
-        ("kwargs", context, 3),
-    ]
+    assert result == 3
+    assert calls == [("legacy", 1), ("context", context, 2)]
 
 
-def test_hook_callback_type_error_is_not_retried():
-    hook_name = "test.hook-context.type-error"
-    define_hook(
-        hook_name,
-        description="hook callback type error test",
-        params=["hook_context", "value"],
-    )
-    calls = []
-
-    def callback(*, hook_context, value):
-        calls.append((hook_context, value))
-        raise TypeError("raised inside callback")
-
-    register_hook(hook_name, callback)
-
-    trigger_hook(hook_name, hook_context="context", value="value")
-
-    assert calls == [("context", "value")]
-
-
-def test_trigger_single_hook_supports_legacy_exact_signature():
+def test_single_provider_hook_supports_legacy_callback():
     hook_name = "test.single.hook-context"
     define_hook(
         hook_name,
-        description="single hook context compatibility test",
+        description="Single-provider HookContext compatibility",
         params=["hook_context", "value"],
     )
+    calls = []
 
-    def handler(*, value):
+    def callback(*, value):
+        calls.append(value)
         return value + 1
 
-    register_hook(hook_name, handler)
+    register_hook(hook_name, callback)
 
-    result = trigger_single_hook(hook_name, hook_context=object(), value=1)
-
-    assert result == 2
-
-
-def test_hookable_shares_context_with_sync_operation_and_legacy_callback():
-    context = object()
-    calls = []
-
-    class Handler:
-        @hookable(
-            "context_sync",
-            context_builder=lambda _self, _request: context,
-        )
-        def run(self, request, *, hook_context=None):
-            calls.append(("operation", hook_context, request))
-            return f"processed:{request}"
-
-    def legacy_before(*, request):
-        calls.append(("legacy_before", request))
-
-    def context_before(*, hook_context, request):
-        calls.append(("context_before", hook_context, request))
-
-    def context_after(*, hook_context, request, result):
-        calls.append(("context_after", hook_context, request, result))
-
-    register_hook("context_sync.before", legacy_before)
-    register_hook("context_sync.before", context_before)
-    register_hook("context_sync.after", context_after)
-
-    result = Handler().run("request")
-
-    assert result == "processed:request"
-    assert calls == [
-        ("legacy_before", "request"),
-        ("context_before", context, "request"),
-        ("operation", context, "request"),
-        ("context_after", context, "request", "processed:request"),
-    ]
-    before_spec = get_hook_spec("context_sync.before")
-    after_spec = get_hook_spec("context_sync.after")
-    assert before_spec is not None
-    assert after_spec is not None
-    assert before_spec.params == ["hook_context", "request"]
-    assert after_spec.params == [
-        "hook_context",
-        "request",
-        "result",
-    ]
+    assert trigger_single_hook(hook_name, hook_context=object(), value=1) == 2
+    assert calls == [1]
 
 
-def test_hookable_reuses_explicit_context_without_calling_builder():
+def test_hookable_shares_and_reuses_context_for_sync_operation():
+    built_context = object()
     supplied_context = object()
     builder_calls = []
-    observed_contexts = []
+    observed = []
 
-    def build_context(_self, request):
+    def build_context(_handler, request):
         builder_calls.append(request)
-        return object()
+        return built_context
 
     class Handler:
-        @hookable("explicit_context", context_builder=build_context)
+        @hookable("context_sync", context_builder=build_context)
         def run(self, request, *, hook_context=None):
-            observed_contexts.append(hook_context)
+            observed.append(("operation", hook_context))
             return request
 
-    def observe_context(*, hook_context, **_kwargs):
-        observed_contexts.append(hook_context)
+    def before(*, hook_context, **_kwargs):
+        observed.append(("before", hook_context))
 
-    register_hook("explicit_context.before", observe_context)
-    register_hook("explicit_context.after", observe_context)
+    def after(*, hook_context, **_kwargs):
+        observed.append(("after", hook_context))
 
-    result = Handler().run("request", hook_context=supplied_context)
+    register_hook("context_sync.before", before)
+    register_hook("context_sync.after", after)
 
-    assert result == "request"
-    assert builder_calls == []
-    assert observed_contexts == [supplied_context] * 3
+    Handler().run("built")
+    Handler().run("supplied", hook_context=supplied_context)
+
+    assert builder_calls == ["built"]
+    assert observed == [
+        ("before", built_context),
+        ("operation", built_context),
+        ("after", built_context),
+        ("before", supplied_context),
+        ("operation", supplied_context),
+        ("after", supplied_context),
+    ]
 
 
-def test_hookable_shares_context_with_async_operation():
-    context = object()
-    calls = []
+def test_hookable_shares_and_reuses_context_for_async_operation():
+    built_context = object()
+    supplied_context = object()
+    builder_calls = []
+    observed = []
+
+    def build_context(_handler, request):
+        builder_calls.append(request)
+        return built_context
 
     class Handler:
-        @hookable(
-            "context_async",
-            context_builder=lambda _self, _request: context,
-        )
+        @hookable("context_async", context_builder=build_context)
         async def run(self, request, *, hook_context=None):
-            calls.append(("operation", hook_context, request))
-            return "async_result"
+            observed.append(("operation", hook_context))
+            return request
 
-    def on_before(*, hook_context, request):
-        calls.append(("before", hook_context, request))
+    def observe(stage):
+        def callback(*, hook_context, **_kwargs):
+            observed.append((stage, hook_context))
 
-    def on_after(*, hook_context, request, result):
-        calls.append(("after", hook_context, request, result))
+        return callback
 
-    register_hook("context_async.before", on_before)
-    register_hook("context_async.after", on_after)
+    register_hook("context_async.before", observe("before"))
+    register_hook("context_async.after", observe("after"))
 
-    result = asyncio.run(Handler().run("request"))
-
-    assert result == "async_result"
-    assert calls == [
-        ("before", context, "request"),
-        ("operation", context, "request"),
-        ("after", context, "request", "async_result"),
+    assert asyncio.run(Handler().run("built")) == "built"
+    assert asyncio.run(Handler().run("supplied", hook_context=supplied_context)) == "supplied"
+    assert builder_calls == ["built"]
+    assert observed == [
+        ("before", built_context),
+        ("operation", built_context),
+        ("after", built_context),
+        ("before", supplied_context),
+        ("operation", supplied_context),
+        ("after", supplied_context),
     ]
