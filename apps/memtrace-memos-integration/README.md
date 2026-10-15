@@ -54,10 +54,67 @@ Call a working MemOS `/product/add` or `/product/search` endpoint (available in 
 After the operation, list the saved graphs:
 
 ```bash
-find .memos/memtrace -type f -name '*.json' -print
+find .memos/memtrace -type f -name 'index.md' -print
 ```
 
-Files are stored under a user-specific directory, one JSON graph per MemOS `trace_id`. Open a file to inspect `data.nodes`, `data.edges`, `data.operations`, and `data.sessions`. User and trace path components contain a readable prefix plus a hash, so the filename is not necessarily the raw trace ID. The graph's `graph_id` contains the trace ID.
+Open your user's `index.md` to browse requests, newest first. Each row includes the
+request time with UTC offset, entry type, a bounded query/message preview, the full
+trace ID, and a relative link to its `graph.json`.
+
+```text
+.memos/memtrace/
+└── alice--<short-user-hash>/
+    ├── _user.json
+    ├── index.md
+    ├── _index.json
+    └── 2026-10-15/
+        ├── search/
+        │   └── 14-32-10.125__<trace-prefix>--<short-trace-hash>/
+        │       ├── graph.json
+        │       └── meta.json
+        └── add/
+            └── 14-35-22.410__<trace-prefix>--<short-trace-hash>/
+                ├── graph.json
+                └── meta.json
+```
+
+The date, time, and entry-type folders are fixed when a trace is first recorded.
+`search` covers Search events; `add` covers Add, MemReader, and text-memory events.
+Traces first observed through scheduler events use `memread`; other events use
+`other`. Later asynchronous events, cache eviction, restarts, and timezone changes
+continue the original graph without moving it or splitting it across folders.
+
+Dates and times default to the **local timezone of the machine/container running
+the MemOS service**, including daylight-saving rules at the event's date. No extra
+configuration is needed. Set `MEMOS_SMARTCOMMENT_OUTPUT_TIMEZONE=local` explicitly
+to restore this behavior if a timezone override was previously configured.
+To force a specific timezone instead, set it before starting the service:
+
+```bash
+export MEMOS_SMARTCOMMENT_OUTPUT_TIMEZONE=Asia/Shanghai
+```
+
+`meta.json` records the full user/trace/project IDs, first/latest event timestamps,
+timezone, entry type, summary, session/task IDs, cubes, operations, and relative
+graph path. `_index.json` maps full trace IDs to that metadata. The writer rebuilds
+its in-memory catalog from per-trace metadata on first access, and republishes the
+two user indexes on the next successful write, recovering missing, corrupt, or
+stale indexes. `_user.json` retains the full user identity. Readable ID prefixes
+keep Unicode letters, are limited to 32 characters, and carry a 12-character hash;
+hash collisions extend the suffix instead of overwriting another request.
+
+Graph contents remain `data.nodes`, `data.edges`, `data.operations`, and
+`data.sessions`, with `graph_id` equal to the complete trace ID. There is still one
+graph per `(user_id, trace_id)`: reusing a trace across requests keeps them together.
+For one graph per request, supply a unique trace ID at the request entry and carry
+it through asynchronous tasks. This plugin does not change request trace IDs.
+`adapter.output_path(trace_id, user_id)` resolves an allocated graph and raises
+`FileNotFoundError` before the writer has allocated that trace.
+
+**The previous flat `<user>/<trace>.json` layout is not read or migrated.** Existing
+files are left untouched; graph restoration and Search lineage use only the new
+layout. To list actual graphs, use `find .memos/memtrace -name graph.json` rather
+than treating metadata/index JSON files as graphs.
 
 ## Configuration
 
@@ -67,6 +124,7 @@ Set these environment variables before loading the plugin. Restart MemOS after c
 | --- | --- | --- |
 | `MEMOS_ENABLED_PLUGINS` | unset | Include `smartcomment` to enable this opt-in plugin. |
 | `MEMOS_SMARTCOMMENT_OUTPUT_DIR` | `.memos/memtrace` | Directory for JSON graphs. |
+| `MEMOS_SMARTCOMMENT_OUTPUT_TIMEZONE` | `local` | Service machine's local timezone by default; an IANA name such as `Asia/Shanghai` or `UTC` overrides it. |
 | `MEMOS_SMARTCOMMENT_QUEUE_SIZE` | `1024` | Maximum queued trace events; a full queue drops events with a warning. |
 | `MEMOS_SMARTCOMMENT_MAX_VALUE_CHARS` | `20000` | Maximum length of each captured string. |
 | `MEMOS_SMARTCOMMENT_STRICT` | `false` | Enable smartcomment identity checks. |
@@ -74,10 +132,57 @@ Set these environment variables before loading the plugin. Restart MemOS after c
 | `MEMOS_SMARTCOMMENT_MAX_CACHED_TRACES` | `64` | Maximum graphs retained in memory. |
 | `MEMOS_SMARTCOMMENT_MAX_CACHED_GRAPH_ITEMS` | `50000` | Maximum cached nodes, edges, operations, and sessions. |
 | `MEMOS_SMARTCOMMENT_CACHE_TTL_SECONDS` | `300` | Idle cache expiration in seconds. |
+| `MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD` | `false` | Include the Add ancestry of final Search hits and link persisted memory nodes to the final result lists. |
 
 Snapshots are written atomically. An idle or full in-memory cache can be evicted; a later event restores the saved graph and appends to it. Cache limits do not delete JSON files. Use a different output directory for each writer process, including when running multiple server workers.
 
-Credential-named fields are redacted, embedding/vector fields are omitted, and long values are bounded before events enter the queue. JSON strings in `argument` and `arguments` are decoded and recursively redacted; unparseable argument strings are omitted. **Free-form message and memory text can still appear in graphs**, up to the length limit. Store the output directory with access appropriate for that data.
+### Connect Search results to their Add history
+
+```bash
+export MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD=true
+```
+
+Restart MemOS after setting the switch. At `search.results.after_rerank`, the writer
+matches each final result by `(cube_id, memory_id)` within the same user and project,
+reads the existing JSON snapshots, and imports only the matched persisted node and
+its upstream Add/MemRead dependencies into the Search graph:
+
+```text
+message batch -> extracted memory -> persisted memory -> enhanced memory
+                                                            |
+                                                            v
+                                                    persisted memory
+                                                            |
+                                                   memory_search_lineage
+                                                            v
+                                                 final search memory list
+```
+
+The new edge points **from the persisted memory to the final Search list**. Only
+explicit incoming dependencies are followed; sibling outputs from the same Add,
+unrelated memories, downstream archive/delete branches, and prior Search graphs
+are not imported. A shared ancestor is included once. If multiple source memories
+actually contributed to a merged memory, all those ancestors remain relevant.
+Message batches remain the original captured units; the plugin does not infer
+which individual messages within a batch contributed to a memory.
+
+Raw candidates and filtered lists do not trigger Add imports. Repeated hits in one
+list share a single link; the same memory in different final lists links to each.
+Missing IDs, unavailable Add history, and ambiguous identities produce no guessed
+links. `memos.search.link_add_lineage` reports linked/unresolved counts for distinct
+identifiable hits per list. Imported items retain `lineage_source_trace_id` metadata;
+the original Add files are unchanged.
+
+History lookup runs on the asynchronous writer and reads this user's indexed `graph.json` files across all dates and entry types
+once per final Search event. Its temporary index grows with that user's captured
+history; keep the output directory scoped to the history you need. It works after
+cache eviction or restart and can use snapshots captured before enabling the switch.
+Only history already written to this output directory is available at Search time;
+late Add events do not retroactively update completed Search graphs. Existing nodes
+already native to the same trace are retained. Turning the switch off affects future
+Search events and does not remove links from previously saved graphs.
+
+Credential-named fields are redacted, embedding/vector fields are omitted, and long values are bounded before events enter the queue. JSON strings in `argument` and `arguments` are decoded and recursively redacted; unparseable argument strings are omitted. **Free-form message and memory text can still appear in graphs**, up to the length limit. Request summaries copy at most 160 characters (plus an ellipsis) from the already-captured query or message batch into metadata and indexes; they do not call an LLM. Markdown display escapes user text. Store the output directory with access appropriate for that data.
 
 ## If no graph appears
 
@@ -170,37 +275,65 @@ successful database write. Failure Hooks only observe exceptions reaching their 
 If an enhanced-write exception reaches that boundary, subsequent source-memory deletion
 is skipped for that operation. Failure does not imply rollback of writes already committed.
 
-The Search API emits this ordered result pipeline:
+With all post-processing stages enabled, the Search graph has this ordered result
+pipeline for each populated type/cube bucket:
 
 ```text
-search_query
-  -- memos.search.retrieve --> raw memory nodes
-  -- memos.search.threshold_filter --> threshold memory nodes; removed nodes -> "filtered"
-  -- memos.search.deduplicate --> deduplicated memory nodes; removed nodes -> "filtered"
-  -- memos.search.rerank --> reranked memory nodes
+query -> memory type -> cube -> raw list -> threshold list -> dedup list -> rerank list
+                                  |              |              |
+                                  v              v              v
+                            threshold's      dedup's        rerank's
+                            filtered list    filtered list  filtered list
 ```
 
-Every Search stage materializes its current candidates as separate, stage-scoped
-`search_memory` nodes. The node value contains the memory ID, text, score, result type, and
-cube ID. Its comment records the one-based `rank`, stage, rank scope, and global position.
-Rank scope is one result-type/cube bucket because the Search API returns bucketed results.
-The current API rerank stage is recorded as a descending `metadata.relativity` sort
-(`relativity_sort`). Search nodes describe the Search pipeline and do not reference
-persisted memory units.
+Raw retrieval creates `search_memory_type` and `search_cube` branch nodes followed
+by one `search_memory_list` node per nonempty bucket. Empty types and cubes are
+omitted. The three retrieval links use `memory_type_branch`, `memory_cube_branch`,
+and `memory_retrieval`, respectively. Every enabled, observed stage creates one new
+list node per observed bucket and connects the last recorded list directly to it.
+A fully removed bucket continues as an empty list, preserving the stage chain.
 
-Search stages use explicit links rather than the input/output Cartesian product. Threshold
-and deduplication link each surviving source to its new stage node, while removed memories
-link to one stage-scoped `"filtered"` string node. Rerank likewise links each
-source to the new node with the same memory ID, including knowledge memories whose text is
-expanded with original document content. Matching uses result type, cube and memory ID;
-candidates without an ID use a content fingerprint computed before truncation. New
-candidates are retained even when no source edge is known. This keeps every Hook visible as
-one step in the Search flow, including stages whose values did not change.
+The plugin follows the API's current stage conditions even though the API emits
+Hooks for disabled stages: threshold is recorded only when `relativity > 0`, and
+dedup only when `dedup` is `"sim"` or `"mmr"`. Disabled stages produce no events,
+nodes, or edges. For example, `relativity=0` yields `raw -> dedup -> rerank` when
+dedup is enabled; setting `dedup="no"` as well yields `raw -> rerank`. An enabled
+stage is retained even if its results are unchanged. Missing intermediate Hooks
+also leave the last recorded stage as the predecessor.
 
-Search observation ends at `search.results.after_rerank`, which releases the operation's
-cached stage nodes. All Search hooks use the shared `HookContext.operation_id` as their graph and cache
-scope, so multiple searches in one trace cannot reuse or clear each other's stage nodes.
-Post-processing failures clear only the failed operation's cached stage nodes.
+The API always runs its post-processing `rerank_knowledge_mem` on a successful
+search, so its rerank stage is still recorded when `search_req.rerank=False`.
+That request flag controls the internal retrieval reranker before raw, not this
+post-processing stage. The plugin does not change which business stages execute.
+
+List entries contain `memory_id`, `memory`, and `score`, in the order returned by
+the Hook. Result type, cube ID, stage, bucket position, and `memory_count` belong to
+the list node's metadata. Individual memories no longer create graph nodes, ranks,
+or pairwise node matches. Snapshots are taken per entry so the outer list retains
+all results, including lists longer than 200 entries; field truncation and redaction
+still apply within each entry. With `MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD=true`,
+final lists additionally receive incoming links from matching persisted memory units.
+
+When a stage removes entries, its last recorded list also connects to a
+`search_filter_result` node containing the removed entries, rather than a status
+string. One filtered list is created per affected bucket. Differences preserve
+duplicate counts and prefer identical entries before falling back to memory ID
+(or original text for anonymous entries), so reordered results and expanded text
+with the same ID are not treated as removals. `filtered_count` counts removed
+memories across buckets. No filtered node is created when nothing was removed.
+
+Branches and lists use `HookContext.operation_id` as their search scope. List links
+use result type, cube ID, and the occurrence of that cube within the type; buckets
+without IDs use their position. Reordered unique cube IDs remain correctly linked.
+Repeated or missing cube IDs rely on stable occurrence order or position. A new
+bucket without a previous-stage list is retained without a guessed source edge.
+
+Search observation ends at `search.results.after_rerank`. Each search caches only
+its latest recorded lists; skipped stages leave that cache intact. Rerank,
+post-processing failure, and shutdown release
+remaining caches in their respective scopes. The current rerank event describes
+the API's descending `metadata.relativity` sort; the tracing handler preserves
+observed order and does not sort results itself.
 
 The exported graph omits smartcomment's internal `COMMENT:NONE@1` sentinel node, its
 incident edges, and its sentinel session. Root inputs and outputs remain normal semantic
@@ -226,7 +359,7 @@ Keep machine identifiers separate from reader-facing descriptions:
   explains the observation in the exported operation and session. Each built-in link
   has its own description of the source-to-target relationship.
 - Write comments describe returned IDs, not independently confirmed database writes.
-  Search comments distinguish bucket-local rank from traversal order, and removal
+  Search comments describe whole lists at each stage and distinguish removal
   from search results from deletion in storage. Scheduler comments identify the backend
   operation, including `delete` versus `soft_delete`, without claiming every input was removed.
 
@@ -285,7 +418,26 @@ operation's data contract; unknown lineage keeps its nodes without a guessed edg
 
 ## Verify the integration
 
-The plugin regression tests are maintained locally and are not included in this directory.
+Run the Search-to-Add lineage regression tests from this directory:
+
+```bash
+PYTHONPATH=. python -m pytest tests/test_search_lineage.py -q
+```
+
+They exercise actual Add/Search hooks, final-hit selection, shared ancestors,
+cross-trace refinement, user/cube isolation, opt-in behavior, and durable restore.
+
+Run the local search-branch regression tests (ignored by Git) from this directory
+with the integration and its dependencies installed:
+
+```bash
+PYTHONPATH=. python -m pytest tests/handlers/test_search_handler.py -q
+```
+
+These tests cover populated and empty branches, list size independent of graph size,
+filtered contents including duplicates, cube identity, operation isolation, and
+exported list continuity through post-processing in strict and non-strict modes. Additional plugin regression tests are maintained locally.
+
 For an installed integration, follow the Quick start package and entry-point check, enable
 the plugin, and run a memory operation. Inspect the resulting JSON graph's `graph_id`,
 `data.nodes`, and `data.edges`, and check the service logs for writer failures or dropped
