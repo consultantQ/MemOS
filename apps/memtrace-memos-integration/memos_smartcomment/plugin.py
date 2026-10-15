@@ -64,9 +64,10 @@ class SmartCommentPlugin(MemOSPlugin):
         ):
             self.register_hook(hook, callback)
         logger.info(
-            "smartcomment plugin loaded; output_dir=%s queue_size=%d",
+            "smartcomment plugin loaded; output_dir=%s queue_size=%d link_search_to_add=%s",
             settings.output_dir,
             settings.queue_size,
+            settings.link_search_to_add,
         )
 
     def init_components(self, context: dict[str, Any]) -> None:

@@ -1,20 +1,18 @@
 # One worker serializes events into per-user, per-trace graph snapshots.
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import queue
-import re
 import threading
 import time
 
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol
-from uuid import uuid4
 
+from memos_smartcomment.lineage import connect_search_lineage
 from memos_smartcomment.recorder import SmartCommentRecorder
+from memos_smartcomment.storage import TraceStore
 
 
 # isort: split
@@ -23,7 +21,7 @@ from memos.log import get_logger
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from memos_smartcomment.config import SmartCommentSettings
@@ -58,14 +56,6 @@ class _CachedRecorder:
     graph_items: int
 
 
-# Hash the original ID to prevent collisions after sanitizing or truncating the prefix.
-def _safe_path_component(value: str | None, fallback: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value or fallback).strip("._")
-    prefix = (normalized or fallback)[:80]
-    digest = hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()
-    return f"{prefix}-{digest}"
-
-
 class AsyncTraceAdapter:
     """Bounded event queue and graph cache, with one snapshot-writing worker."""
 
@@ -76,6 +66,7 @@ class AsyncTraceAdapter:
         recorder_factory: Callable[[TraceEvent], Recorder] | None = None,
     ) -> None:
         self.settings = settings
+        self._store = TraceStore(settings)
         self._recorder_factory = recorder_factory or (
             lambda event: SmartCommentRecorder(settings, event)
         )
@@ -153,29 +144,49 @@ class AsyncTraceAdapter:
 
     # Worker-owned persistence: restore durable snapshots and atomically replace them.
     def output_path(self, trace_id: str, user_id: str | None = None) -> Path:
-        user_part = _safe_path_component(user_id, "anonymous")
-        trace_part = _safe_path_component(trace_id, "trace")
-        return self.settings.output_dir / user_part / f"{trace_part}.json"
+        """Resolve an allocated trace; raises FileNotFoundError before its first write."""
+        return self._store.output_path(trace_id, user_id)
 
     def _read_snapshot(self, event: TraceEvent) -> dict[str, Any] | None:
-        path = self.output_path(event.trace_id, event.user_id)
+        try:
+            path = self.output_path(event.trace_id, event.user_id)
+        except FileNotFoundError:
+            return None
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
         return None
 
+    def _link_search_lineage(self, event: TraceEvent, recorder: Recorder) -> None:
+        current = recorder.export_graph()
+
+        def sources() -> Iterator[dict[str, Any]]:
+            # The current trace may not have a path yet (e.g. rerank is its first event).
+            for candidate in self._store.graph_paths(event.user_id):
+                try:
+                    snapshot = json.loads(candidate.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(snapshot, dict)
+                        and snapshot.get("graph_id") != event.trace_id
+                        and isinstance(snapshot.get("data"), dict)
+                    ):
+                        yield snapshot
+                except (OSError, ValueError):
+                    logger.warning("Unable to read Add lineage snapshot: %s", candidate.name)
+
+        try:
+            merged, link_event = connect_search_lineage(current, event, sources())
+            if link_event is not None:
+                recorder.restore_graph(merged)
+                recorder.record(link_event)
+        except Exception:
+            # Optional historical enrichment must not lose this Search's own graph.
+            recorder.restore_graph(current)
+            logger.exception("Failed to connect Add lineage for Search trace %s", event.trace_id)
+
     # Replace atomically so readers cannot observe a partial snapshot.
     def _export(self, event: TraceEvent, recorder: Recorder) -> int:
         exported = recorder.export_graph()
-        output_path = self.output_path(event.trace_id, event.user_id)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = output_path.with_name(f".{output_path.name}.{uuid4().hex}.tmp")
-        try:
-            temporary_path.write_text(
-                json.dumps(exported, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            os.replace(temporary_path, output_path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
+        self._store.write(event, exported)
         data = exported.get("data", {})
         return sum(len(data.get(key, ())) for key in ("nodes", "edges", "operations", "sessions"))
 
@@ -207,6 +218,8 @@ class AsyncTraceAdapter:
             recorder = cached.recorder
         # Cache only committed snapshots; failures reload the last durable graph.
         recorder.record(event)
+        if self.settings.link_search_to_add and event.operation == "memos.search.rerank":
+            self._link_search_lineage(event, recorder)
         graph_items = self._export(event, recorder)
         self._recorders[key] = _CachedRecorder(recorder, time.monotonic(), graph_items)
         self._cached_graph_items += graph_items

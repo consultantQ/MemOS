@@ -38,6 +38,10 @@ class SmartCommentSettings:
     max_cached_traces: int = 64
     max_cached_graph_items: int = 50_000
     cache_ttl_seconds: float = 300
+    # Import only the persisted ancestors of final Search results.
+    link_search_to_add: bool = True
+    # "local" follows the service machine; an IANA timezone overrides it.
+    output_timezone: str = "local"
 
     @classmethod
     def from_env(cls) -> SmartCommentSettings:
@@ -57,4 +61,6 @@ class SmartCommentSettings:
                 "MEMOS_SMARTCOMMENT_MAX_CACHED_GRAPH_ITEMS", 50_000
             ),
             cache_ttl_seconds=_positive_int("MEMOS_SMARTCOMMENT_CACHE_TTL_SECONDS", 300),
+            link_search_to_add=_as_bool("MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD"),
+            output_timezone=os.getenv("MEMOS_SMARTCOMMENT_OUTPUT_TIMEZONE", "local"),
         )

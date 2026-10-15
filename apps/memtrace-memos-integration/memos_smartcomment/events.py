@@ -21,7 +21,6 @@ class TraceValue:
     identity_only: bool = False
     comment: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    match_key: str | None = None  # Correlation key computed before snapshot truncation.
 
 
 # Category/comment inherit operation defaults; link metadata overrides operation metadata.

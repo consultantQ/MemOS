@@ -312,13 +312,14 @@ class AddHandler(BaseHandler):
         metadata: dict[str, Any] | None = None,
     ) -> TraceValue:
         trace_id = _current_trace_id(subject)
+        mode = (metadata or {}).get("mode") or "unknown"
         return self._value(
             value=_memory_text(memory),
             identity=f"extracted_memory:{trace_id}:{cube_id or 'unknown'}:{memory_id}",
             category="extracted_memory",
             class_name="memory",
             identity_only=identity_only,
-            comment="Memory candidate after MemReader extraction, not yet persisted.",
+            comment=f"Memory candidates are extracted from the user message at the MemReader stage (mode: {mode}).",
             metadata=metadata,
         )
 
@@ -491,7 +492,7 @@ class AddHandler(BaseHandler):
             class_name="memory",
             identity_only=memory is None,
             comment=(
-                f"Persisted memory unit matched to an ID returned at {stage}."
+                f"The persisted memory unit that is written to the database and whose memory ID is {memory_id}."
                 if memory is not None
                 else f"Write returned this memory ID at {stage}. Its source and content are unresolved."
             ),
@@ -781,7 +782,7 @@ class AddHandler(BaseHandler):
                         target=target,
                         category="memory_refinement",
                         comment=(
-                            "Refine the memory unit through the fine-transfer stage of the MemRead Scheduler."
+                            "Refine the memory unit asynchronously in the background through the fine-transfer stage of the MemRead Scheduler."
                         ),
                     )
                     for source in source_values
@@ -808,6 +809,6 @@ class AddHandler(BaseHandler):
             category="enhanced_memory",
             class_name="memory",
             identity_only=identity_only,
-            comment="Enhanced memory candidate produced by the MemRead Scheduler's fine-transfer stage.",
+            comment="Refined memory candidates.",
             metadata={"cube_id": cube_id, "memory_id": memory_id},
         )
