@@ -464,6 +464,28 @@ class APIConfig:
         return APIConfig.get_memreader_config()
 
     @staticmethod
+    def get_suggestion_llm_config() -> dict[str, Any]:
+        """Get LLM configuration for suggestion query generation.
+
+        Fallback chain: SUGGESTION_MODEL -> MEMREADER_GENERAL_MODEL -> memreader config.
+        """
+        suggestion_model = os.getenv("SUGGESTION_MODEL")
+        if suggestion_model:
+            return APIConfig._build_provider_llm_config(suggestion_model)
+        return APIConfig.get_memreader_general_llm_config()
+
+    @staticmethod
+    def get_scheduler_llm_config() -> dict[str, Any]:
+        """Get LLM configuration for scheduler-owned LLM tasks.
+
+        Fallback chain: MEMSCHEDULER_MODEL -> MEMREADER_GENERAL_MODEL.
+        """
+        scheduler_model = os.getenv("MEMSCHEDULER_MODEL")
+        if scheduler_model:
+            return APIConfig._build_provider_llm_config(scheduler_model)
+        return APIConfig.get_memreader_general_llm_config()
+
+    @staticmethod
     def get_image_parser_llm_config() -> dict[str, Any]:
         """Get LLM configuration for image parsing (requires vision model).
 
@@ -622,6 +644,7 @@ class APIConfig:
                     "provider": os.getenv("MOS_EMBEDDER_PROVIDER", "openai"),
                     "api_key": os.getenv("MOS_EMBEDDER_API_KEY", "sk-xxxx"),
                     "model_name_or_path": os.getenv("MOS_EMBEDDER_MODEL", "text-embedding-3-large"),
+                    "embedding_dims": int(os.getenv("EMBEDDING_DIMENSION", "1024")),
                     "headers_extra": json.loads(os.getenv("MOS_EMBEDDER_HEADERS_EXTRA", "{}")),
                     "base_url": os.getenv("MOS_EMBEDDER_API_BASE", "http://openai.com"),
                     "backup_client": os.getenv("MOS_EMBEDDER_BACKUP_CLIENT", "false").lower()

@@ -37,6 +37,8 @@ const CURRENT_TAG_PREFIX = "memos-local-plugin-v";
 const TAG_PREFIXES = [CURRENT_TAG_PREFIX, "openclaw-local-plugin-v"];
 const RELEASE_NOTES_MARKER = "doc-agent-release-notes-json";
 const RELEASE_CATEGORY_ORDER = ["Added", "Improved", "Fixed"];
+const MIN_RELEASE_TOPICS = 12;
+const MAX_RELEASE_TOPICS = 18;
 const MAX_DRAFT_REPAIR_ATTEMPTS = 3;
 const RELEASE_TO_DOC_CATEGORY = {
   Added: "New Features",
@@ -51,6 +53,11 @@ function fail(message) {
 
 function warn(message) {
   console.error(`::warning::${message}`);
+}
+
+export function releaseTopicLimitForRequiredCount(requiredCount) {
+  const count = Math.max(0, Number(requiredCount) || 0);
+  return Math.min(MAX_RELEASE_TOPICS, Math.max(MIN_RELEASE_TOPICS, Math.ceil(count / 2)));
 }
 
 function sh(args, options = {}) {
@@ -72,10 +79,10 @@ export function displayVersion(raw) {
   return value ? `v${value}` : "";
 }
 
-export function isLegacyPackageOnlyRelease({ targetVersion, npmDistTag = "" } = {}) {
+export function isLegacyPackageOnlyRelease({ targetVersion, npmDistTag = "", forcePackageOnly = false } = {}) {
   const parsed = parseSemver(targetVersion);
   const distTag = String(npmDistTag || "").trim();
-  return Boolean(parsed?.prerelease) || Boolean(distTag && distTag !== "latest");
+  return Boolean(forcePackageOnly) || Boolean(parsed?.prerelease) || Boolean(distTag && distTag !== "latest");
 }
 
 export function versionFromTag(tag) {
@@ -203,22 +210,90 @@ export function findPreviousTag(targetVersion, currentTag, options = {}) {
   return selectPreviousTag(listProductTags(), targetVersion, currentTag, options);
 }
 
+function commitIdentity(commit) {
+  return String(commit?.sha || commit?.short_sha || "").toLowerCase();
+}
+
+function revertTargetSha(commit) {
+  return `${commit?.subject || ""}\n${commit?.body || ""}`.match(
+    /This reverts commit ([0-9a-f]{7,40})\b/i,
+  )?.[1]?.toLowerCase() || "";
+}
+
+function revertedSubject(commit) {
+  return String(commit?.subject || "").match(/^Revert\s+"(.+)"(?:\s+\(#\d+\))?$/i)?.[1] || "";
+}
+
+function commitMatchesSha(commit, targetSha) {
+  const identity = commitIdentity(commit);
+  return Boolean(identity && targetSha && (identity.startsWith(targetSha) || targetSha.startsWith(identity)));
+}
+
+export function filterNetEffectiveCommits(commits) {
+  const chronological = [...commits].reverse();
+  const seen = [];
+  const active = new Map();
+  const effectRoot = new Map();
+  const resolvedReverts = new Set();
+
+  for (const commit of chronological) {
+    const identity = commitIdentity(commit);
+    if (!identity) continue;
+
+    const isRevert = /^revert\b/i.test(String(commit.subject || ""));
+    let target = null;
+    if (isRevert) {
+      const targetSha = revertTargetSha(commit);
+      if (targetSha) {
+        target = [...seen].reverse().find((candidate) => commitMatchesSha(candidate, targetSha)) || null;
+      } else {
+        const targetSubject = revertedSubject(commit).toLowerCase();
+        if (targetSubject) {
+          target =
+            [...seen]
+              .reverse()
+              .find((candidate) => String(candidate.subject || "").toLowerCase() === targetSubject) || null;
+        }
+      }
+    }
+
+    if (target) {
+      const targetIdentity = commitIdentity(target);
+      const root = effectRoot.get(targetIdentity) || targetIdentity;
+      active.set(root, !active.get(root));
+      effectRoot.set(identity, root);
+      resolvedReverts.add(identity);
+    } else {
+      active.set(identity, true);
+      effectRoot.set(identity, identity);
+    }
+    seen.push(commit);
+  }
+
+  return commits.filter((commit) => {
+    const identity = commitIdentity(commit);
+    return identity && !resolvedReverts.has(identity) && active.get(identity) === true;
+  });
+}
+
 function parseCommits(previousTag, currentRef) {
   const text = sh([
     "log",
-    "--format=%H%x09%h%x09%s",
+    "--format=%H%x1f%h%x1f%s%x1f%b%x1e",
     "--no-merges",
     `${previousTag}..${currentRef}`,
     "--",
     PRODUCT_PATH,
   ]);
-  return text
-    .split("\n")
+  const commits = text
+    .split("\x1e")
+    .map((record) => record.trim())
     .filter(Boolean)
-    .map((line) => {
-      const [sha = "", shortSha = "", subject = ""] = line.split("\t");
-      return { sha, short_sha: shortSha, subject };
+    .map((record) => {
+      const [sha = "", shortSha = "", subject = "", body = ""] = record.split("\x1f");
+      return { sha, short_sha: shortSha, subject, body };
     });
+  return filterNetEffectiveCommits(commits).map(({ body: _body, ...commit }) => commit);
 }
 
 function parseChangedFiles(previousTag, currentRef) {
@@ -271,10 +346,17 @@ function categoryHintForSubject(subject) {
   const lower = value.toLowerCase();
   if (
     lower.startsWith("release:") ||
+    /^(ci|chore|docs|test|style|build)(\([^)]+\))?:/i.test(value) ||
     /^fix(\([^)]+\))?:\s*ruff\b/i.test(value) ||
     /review feedback/i.test(value)
   ) {
     return null;
+  }
+  if (/^revert\b/i.test(value)) {
+    return {
+      category: "Fixed",
+      reason: "user-visible rollback of behavior introduced before this release range",
+    };
   }
   if (/^(feat|feature|add)(\([^)]+\))?:|^add\s+/i.test(value)) {
     return {
@@ -314,7 +396,10 @@ function categoryHintForSubject(subject) {
       reason: "specific bug fix",
     };
   }
-  return null;
+  return {
+    category: "Improved",
+    reason: "path-scoped local-plugin change requiring product-facing classification",
+  };
 }
 
 export function categoryHintsForCommits(commits) {
@@ -332,13 +417,151 @@ export function categoryHintsForCommits(commits) {
     .filter(Boolean);
 }
 
+const RELEASE_TOPIC_DEFINITIONS = [
+  {
+    key: "hermes-runtime",
+    category: "Fixed",
+    title_hint: "Hermes runtime and bridge reliability",
+    pattern: /hermes|bridge|pgrep|pid|utf-?8|ensure_ascii|world_model/i,
+  },
+  {
+    key: "idle-skill-archival",
+    category: "Improved",
+    title_hint: "Idle skill archival efficiency and safety",
+    pattern: /idle skill|skill archival|archive idle|idle archive/i,
+  },
+  {
+    key: "configuration-secrets",
+    category: "Fixed",
+    title_hint: "Configuration paths and secret fallback handling",
+    pattern: /config path|secret|environment fallback|env resolver|masked apiKey/i,
+  },
+  {
+    key: "llm-slots",
+    category: "Fixed",
+    title_hint: "LLM and Skill Evolver slot configuration",
+    pattern: /l3llm|l3 llm|skillEvolver|maxTokens|headers|dedicated-slot|llm\./i,
+  },
+  {
+    key: "startup-recovery",
+    category: "Fixed",
+    title_hint: "Startup, installer, recovery, and shutdown reliability",
+    pattern: /startup|installer|gateway after|recovery wait|shutdown/i,
+  },
+  {
+    key: "crystallizer",
+    category: "Fixed",
+    title_hint: "Crystallizer draft and summary recovery",
+    pattern: /crystallizer|crystallize|summary\/steps/i,
+  },
+  {
+    key: "trace-storage",
+    category: "Improved",
+    title_hint: "Trace indexing and storage migration reliability",
+    pattern: /trace index|newest-trace|idx_traces|storage|migrator/i,
+  },
+  {
+    key: "reasoning-capabilities",
+    category: "Fixed",
+    title_hint: "Auxiliary reasoning capability reliability",
+    pattern: /auxiliary reasoning|reasoning capabilities/i,
+  },
+  {
+    key: "release-automation",
+    category: "Improved",
+    title_hint: "Local plugin release automation",
+    pattern: /paired local plugin releases|release automation|package inspection/i,
+  },
+];
+
+function releaseTopicDefinition(hint) {
+  const subject = String(hint?.subject || "");
+  const matched = RELEASE_TOPIC_DEFINITIONS.find((definition) => definition.pattern.test(subject));
+  if (matched) return matched;
+  const category = normalizeReleaseCategory(hint?.category) || "Fixed";
+  return {
+    key: `other-${category.toLowerCase()}`,
+    category,
+    title_hint: `${category} local plugin behavior`,
+  };
+}
+
+export function releaseTopicsForCommits(commits) {
+  const topics = new Map();
+  for (const hint of categoryHintsForCommits(commits)) {
+    const definition = releaseTopicDefinition(hint);
+    const existing = topics.get(definition.key) || {
+      key: definition.key,
+      category: definition.category,
+      title_hint: definition.title_hint,
+      reason: "aggregate related user-visible changes into one evidence-backed release item",
+      source_refs: [],
+      subjects: [],
+    };
+    for (const ref of hint.source_refs || []) {
+      if (!existing.source_refs.includes(ref)) existing.source_refs.push(ref);
+    }
+    if (hint.subject && !existing.subjects.includes(hint.subject)) {
+      existing.subjects.push(hint.subject);
+    }
+    topics.set(definition.key, existing);
+  }
+  return compactReleaseTopics(
+    [...topics.values()],
+    releaseTopicLimitForRequiredCount(commits.length),
+  );
+}
+
+export function compactReleaseTopics(
+  rawTopics,
+  maxTopics = releaseTopicLimitForRequiredCount(rawTopics.length),
+) {
+  const topics = rawTopics.map((topic) => ({
+    ...topic,
+    source_refs: [...new Set(topic.source_refs || [])],
+    subjects: [...new Set(topic.subjects || [])],
+  }));
+  let consolidationIndex = 0;
+
+  while (topics.length > maxTopics) {
+    let bestPair = null;
+    for (let left = 0; left < topics.length; left += 1) {
+      for (let right = left + 1; right < topics.length; right += 1) {
+        if (topics[left].category !== topics[right].category) continue;
+        const score = (topics[left].source_refs.length + topics[right].source_refs.length) * 1000 + left + right;
+        if (!bestPair || score < bestPair.score) bestPair = { left, right, score };
+      }
+    }
+    if (!bestPair) {
+      fail(`Cannot compact ${topics.length} local-plugin release topics without mixing categories.`);
+    }
+
+    const first = topics[bestPair.left];
+    const second = topics[bestPair.right];
+    topics.splice(bestPair.right, 1);
+    topics.splice(bestPair.left, 1, {
+      key: `consolidated-${first.category.toLowerCase()}-${consolidationIndex}`,
+      category: first.category,
+      title_hint: `${first.category} local plugin behavior`,
+      reason: "consolidate related user-visible changes while preserving complete evidence coverage",
+      source_refs: [...new Set([...first.source_refs, ...second.source_refs])],
+      subjects: [...new Set([...first.subjects, ...second.subjects])],
+    });
+    consolidationIndex += 1;
+  }
+  return topics;
+}
+
 export function releaseNoteGuidanceForCommits(commits) {
   return {
     ...RELEASE_NOTE_GUIDANCE,
     source_ref_category_hints: categoryHintsForCommits(commits),
+    release_topics: releaseTopicsForCommits(commits),
     source_ref_hint_policy:
       "Treat source_ref_category_hints as advisory classification hints grounded in evidence. " +
-      "Use them to avoid moving performance/compatibility work into Fixed merely because the commit subject starts with fix.",
+      "Use them to avoid moving performance/compatibility work into Fixed merely because the commit subject starts with fix. " +
+      "Treat release_topics as the required coverage units: write at most one concise release item per topic, " +
+      "and preserve every topic source_ref on that item.",
   };
 }
 
@@ -359,6 +582,15 @@ export function collectEvidence({ targetVersion, currentTag, previousTag, curren
     product_id: PRODUCT_ID,
     product_title: PRODUCT_TITLE,
     release_note_guidance: releaseNoteGuidanceForCommits(commits),
+    release_note_quality_request: {
+      candidate_count: 3,
+      max_repair_attempts: MAX_DRAFT_REPAIR_ATTEMPTS,
+      max_items: releaseTopicLimitForRequiredCount(commits.length),
+      selection_policy: [
+        "Preserve complete evidence coverage and valid source_refs before optimizing readability.",
+        "Prefer 6-10 concise product-facing bullets when possible; for larger releases do not exceed max_items.",
+      ],
+    },
     repo,
     previous_tag: previousTag,
     current_tag: currentTag,
@@ -389,11 +621,12 @@ export function evidenceForInspection(evidence) {
     ...publicEvidence
   } = evidence || {};
   return {
-    ...publicEvidence,
+    ...sanitizeInspectionValue(publicEvidence),
     release_note_guidance: {
       source_ref_category_hints: Array.isArray(guidance.source_ref_category_hints)
         ? guidance.source_ref_category_hints
         : [],
+      release_topics: Array.isArray(guidance.release_topics) ? guidance.release_topics : [],
     },
     redactions: {
       important_diff: "omitted from public workflow artifacts; sent only to the configured draft service",
@@ -403,7 +636,7 @@ export function evidenceForInspection(evidence) {
 }
 
 export function draftForInspection(draft) {
-  return {
+  return sanitizeInspectionValue({
     ok: Boolean(draft?.ok),
     needs_review: Boolean(draft?.needs_review),
     confidence: draft?.confidence || "",
@@ -416,6 +649,13 @@ export function draftForInspection(draft) {
       covered_refs: Array.isArray(draft?.coverage?.covered_refs) ? draft.coverage.covered_refs : [],
       missing_required: Array.isArray(draft?.coverage?.missing_required) ? draft.coverage.missing_required : [],
       invalid_item_refs: Array.isArray(draft?.coverage?.invalid_item_refs) ? draft.coverage.invalid_item_refs : [],
+      items_missing_source_refs: Array.isArray(draft?.coverage?.items_missing_source_refs)
+        ? draft.coverage.items_missing_source_refs
+        : [],
+      quality_issues: Array.isArray(draft?.coverage?.quality_issues)
+        ? draft.coverage.quality_issues
+        : [],
+      candidate_generation_incomplete: draft?.coverage?.candidate_generation_incomplete || null,
     },
     warnings: Array.isArray(draft?.warnings) ? draft.warnings : [],
     language_issues: Array.isArray(draft?.language_issues) ? draft.language_issues : [],
@@ -428,7 +668,7 @@ export function draftForInspection(draft) {
       server_debug_fields: "omitted from public workflow artifacts",
       model_and_prompt_details: "omitted from public workflow artifacts",
     },
-  };
+  });
 }
 
 function appendOutput(name, value) {
@@ -460,19 +700,68 @@ function normalizeReleaseCategory(value) {
   return RELEASE_CATEGORY_ORDER.includes(text) ? text : "";
 }
 
-function normalizeSourceRef(value) {
-  const text = String(value || "").trim().replace(/^[`[(\s]+|[`)\],.;\s]+$/g, "");
-  if (/^\d{2,}$/.test(text)) return `#${text}`;
-  if (/^#\d+$/.test(text)) return text;
-  if (/^[a-fA-F0-9]{7,40}$/.test(text)) return text.toLowerCase();
+function sourceRefFromRepositoryUrl(text, repository) {
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return "";
+  }
+  if (!/^https?:$/.test(parsed.protocol) || parsed.hostname.toLowerCase() !== "github.com") return "";
+  const trustedRepository = String(repository || "").trim();
+  if (!trustedRepository) return "";
+  const expectedRepo = trustedRepository
+    .split("/")
+    .filter(Boolean)
+    .map((part) => part.toLowerCase());
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (
+    expectedRepo.length !== 2 ||
+    parts.length < 4 ||
+    parts[0].toLowerCase() !== expectedRepo[0] ||
+    parts[1].toLowerCase() !== expectedRepo[1]
+  ) {
+    return "";
+  }
+  if (parts[2].toLowerCase() === "pull" && /^\d+$/.test(parts[3])) return `pr:#${parts[3]}`;
+  if (parts[2].toLowerCase() === "commit" && /^[a-fA-F0-9]{7,40}$/.test(parts[3])) {
+    return `sha:${parts[3].toLowerCase()}`;
+  }
   return "";
 }
 
-function normalizeSourceRefs(raw) {
-  const values = Array.isArray(raw) ? raw : String(raw || "").match(/#\d+|[a-fA-F0-9]{7,40}/g) || [];
+function normalizeShaRef(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{7,40}$/.test(text) ? text : "";
+}
+
+function normalizeSourceRef(value, repository = "") {
+  const text = String(value || "").trim().replace(/^[`[(\s]+|[`)\],.;\s]+$/g, "");
+  let match = text.match(/^#\s*(\d+)$/);
+  if (match) return `#${match[1]}`;
+  const urlRef = sourceRefFromRepositoryUrl(text, repository);
+  if (urlRef) return urlRef;
+  match = text.match(/^(?:pr|pull request)\s*:?[\s#]*(\d+)$/i);
+  if (match) return `pr:#${match[1]}`;
+  match = text.match(/^(?:commit|sha)\s*:?[\s#]*([a-fA-F0-9]{7,40})$/i);
+  if (match) return `sha:${match[1].toLowerCase()}`;
+  const shaRef = normalizeShaRef(text);
+  if (shaRef) return shaRef;
+  return "";
+}
+
+function normalizeSourceRefs(raw, repository = "") {
+  const values = Array.isArray(raw)
+    ? raw
+    : (() => {
+        const text = String(raw || "").trim();
+        return normalizeSourceRef(text, repository)
+          ? [text]
+          : text.match(/#\d+|[a-fA-F0-9]{7,40}/g) || [];
+      })();
   const refs = [];
   for (const value of values) {
-    const ref = normalizeSourceRef(value);
+    const ref = normalizeSourceRef(value, repository);
     if (ref && !refs.includes(ref)) refs.push(ref);
   }
   return refs;
@@ -481,7 +770,7 @@ function normalizeSourceRefs(raw) {
 function refsForCommit(commit) {
   const refs = [];
   for (const ref of [commit?.short_sha, commit?.sha]) {
-    const normalized = normalizeSourceRef(ref);
+    const normalized = normalizeShaRef(ref);
     if (normalized && !refs.includes(normalized)) refs.push(normalized);
   }
   for (const match of String(commit?.subject || "").matchAll(/#(\d+)/g)) {
@@ -491,12 +780,12 @@ function refsForCommit(commit) {
   return refs;
 }
 
-function normalizeReleaseItem(raw) {
+function normalizeReleaseItem(raw, repository = "") {
   if (!raw || typeof raw !== "object") return null;
   const category = normalizeReleaseCategory(raw.category);
   const textCn = String(raw.text_cn || "").trim().replace(/^-+\s*/, "");
   const textEn = String(raw.text_en || "").trim().replace(/^-+\s*/, "");
-  const sourceRefs = normalizeSourceRefs(raw.source_refs);
+  const sourceRefs = normalizeSourceRefs(raw.source_refs, repository);
   if (!category || !textCn || !textEn || sourceRefs.length === 0) return null;
   return {
     category,
@@ -506,34 +795,61 @@ function normalizeReleaseItem(raw) {
   };
 }
 
-function buildSourceRefIndex(evidence) {
+function buildSourceRefIndex(evidence, repository = "") {
   const refToGroup = new Map();
   const groups = new Map();
   const knownRefs = new Set();
+  const shaEntriesByFullRef = new Map();
 
   for (const commit of evidence?.commits || []) {
+    const shortRef = normalizeShaRef(commit?.short_sha);
+    const fullRef = normalizeShaRef(commit?.sha);
+    const canonicalShortRef = shortRef || fullRef;
+    const identityRef = fullRef || (canonicalShortRef ? `short:${canonicalShortRef}` : "");
+    if (canonicalShortRef && identityRef && !shaEntriesByFullRef.has(identityRef)) {
+      shaEntriesByFullRef.set(identityRef, {
+        shortRef: canonicalShortRef,
+        fullRef: fullRef || canonicalShortRef,
+      });
+    } else if (
+      canonicalShortRef
+      && identityRef
+      && shaEntriesByFullRef.get(identityRef)?.shortRef !== canonicalShortRef
+    ) {
+      warn(
+        `Evidence contains duplicate SHA ${fullRef || canonicalShortRef} ` +
+          "with different short refs; using the first.",
+      );
+    }
     for (const ref of refsForCommit(commit)) knownRefs.add(ref);
   }
 
-  for (const hint of evidence?.release_note_guidance?.source_ref_category_hints || []) {
-    const refs = normalizeSourceRefs(hint.source_refs);
+  const topics = evidence?.release_note_guidance?.release_topics || [];
+  const sourceGroups = topics.length > 0
+    ? topics
+    : evidence?.release_note_guidance?.source_ref_category_hints || [];
+  for (const [position, hint] of sourceGroups.entries()) {
+    const refs = normalizeSourceRefs(hint.source_refs, repository);
     const category = normalizeReleaseCategory(hint.category);
     if (refs.length === 0 || !category) continue;
-    const groupKey = refs[0];
+    const groupKey = topics.length > 0
+      ? `topic:${String(hint.key || position)}`
+      : refs[0];
     for (const ref of refs) {
-      knownRefs.add(ref);
       refToGroup.set(ref, groupKey);
     }
     groups.set(groupKey, {
       key: groupKey,
       category,
       refs,
-      subject: String(hint.subject || ""),
+      subjects: Array.isArray(hint.subjects)
+        ? hint.subjects.map((value) => String(value || "")).filter(Boolean)
+        : [String(hint.subject || "")].filter(Boolean),
       reason: String(hint.reason || ""),
     });
   }
 
-  return { refToGroup, groups, knownRefs };
+  return { refToGroup, groups, knownRefs, shaEntries: [...shaEntriesByFullRef.values()] };
 }
 
 function groupKeyForRef(ref, refToGroup) {
@@ -549,6 +865,83 @@ function groupKeysForItem(item, refToGroup) {
   return keys;
 }
 
+function canonicalizeEvidenceBackedSourceRefs(items, index) {
+  let normalizedRefs = 0;
+  const ambiguousShaRefs = new Set();
+  const unresolvedShaRefs = new Set();
+  const canonicalizedItems = items.map((item) => {
+    const sourceRefs = [];
+    for (const ref of item.source_refs || []) {
+      let canonicalRef = ref;
+      const explicitPrRef = /^pr:(#\d+)$/.exec(ref)?.[1] || "";
+      const explicitShaRef = /^sha:([a-f0-9]{7,40})$/.exec(ref)?.[1] || "";
+      if (explicitPrRef) canonicalRef = explicitPrRef;
+      if (explicitShaRef) canonicalRef = explicitShaRef;
+      const exactEvidenceRef = index.knownRefs.has(canonicalRef);
+      // The draft service can render an all-numeric short SHA as #digits. Repair that
+      // ambiguous form only when it exactly equals an evidence SHA alias, never a prefix.
+      // A known #digits PR ref must stay a PR. Only an otherwise unknown numeric
+      // reference is eligible for the exact numeric-SHA recovery path.
+      const ambiguousNumericRef = !explicitPrRef && !exactEvidenceRef
+        ? /^#(\d{7,40})$/.exec(canonicalRef)?.[1] || ""
+        : "";
+      const shaCandidate = explicitShaRef
+        || ambiguousNumericRef
+        || (/^[a-f0-9]{7,40}$/.test(canonicalRef) ? canonicalRef : "");
+      if (shaCandidate) {
+        // Numeric #refs require exact aliases. The fullRef arm intentionally covers
+        // the rare but valid case of an all-decimal 40-character Git SHA.
+        const matches = index.shaEntries.filter((entry) => ambiguousNumericRef
+          ? entry.shortRef === ambiguousNumericRef || entry.fullRef === ambiguousNumericRef
+          : entry.fullRef.startsWith(shaCandidate) || entry.shortRef === shaCandidate);
+        // Zero or multiple matches intentionally remain unresolved and fail coverage validation.
+        if (matches.length === 1) {
+          const entry = matches[0];
+          const groupedAlias = [entry.shortRef, entry.fullRef]
+            .find((alias) => index.refToGroup.has(alias));
+          canonicalRef = groupedAlias || (exactEvidenceRef ? canonicalRef : entry.shortRef);
+        } else if (matches.length > 1) {
+          ambiguousShaRefs.add(ref);
+        } else {
+          unresolvedShaRefs.add(ref);
+        }
+      }
+      if (canonicalRef !== ref && index.knownRefs.has(canonicalRef)) normalizedRefs += 1;
+      if (!sourceRefs.includes(canonicalRef)) sourceRefs.push(canonicalRef);
+    }
+    return { ...item, source_refs: sourceRefs };
+  });
+  return {
+    items: canonicalizedItems,
+    normalizedRefs,
+    ambiguousShaRefs: [...ambiguousShaRefs],
+    unresolvedShaRefs: [...unresolvedShaRefs],
+  };
+}
+
+function releaseNotesPostprocess({
+  normalizedRefs = 0,
+  ambiguousShaRefs = [],
+  unresolvedShaRefs = [],
+  droppedInvalidItems = 0,
+  removedDuplicateRefs = 0,
+  droppedEmptyItems = 0,
+  reclassifiedItems = 0,
+  finalItemCount = 0,
+} = {}) {
+  return {
+    applied: true,
+    normalized_evidence_backed_source_refs: normalizedRefs,
+    ambiguous_sha_refs: ambiguousShaRefs,
+    unresolved_sha_refs: unresolvedShaRefs,
+    dropped_invalid_items: droppedInvalidItems,
+    removed_duplicate_source_refs: removedDuplicateRefs,
+    dropped_empty_source_items: droppedEmptyItems,
+    reclassified_items: reclassifiedItems,
+    final_item_count: finalItemCount,
+  };
+}
+
 function bestHintCategoryForItem(item, index) {
   const categories = [];
   for (const key of groupKeysForItem(item, index.refToGroup)) {
@@ -561,7 +954,7 @@ function bestHintCategoryForItem(item, index) {
 
 function subjectsForItem(item, index) {
   return groupKeysForItem(item, index.refToGroup)
-    .map((key) => index.groups.get(key)?.subject || "")
+    .flatMap((key) => index.groups.get(key)?.subjects || [])
     .filter(Boolean)
     .join(" ");
 }
@@ -705,13 +1098,20 @@ function dedupeSourceRefsByBestCategory(items, index) {
   const filtered = [];
   for (const item of items) {
     const refs = [];
+    const ownedGroups = new Set();
     for (const ref of item.source_refs) {
       const groupKey = groupKeyForRef(ref, index.refToGroup);
       const owner = ownerByGroup.get(groupKey);
       if (!owner || owner === item) {
         if (!refs.includes(ref)) refs.push(ref);
+        if (owner === item && index.groups.has(groupKey)) ownedGroups.add(groupKey);
       } else {
         removedDuplicateRefs += 1;
+      }
+    }
+    for (const groupKey of ownedGroups) {
+      for (const ref of index.groups.get(groupKey)?.refs || []) {
+        if (!refs.includes(ref)) refs.push(ref);
       }
     }
     if (refs.length === 0) {
@@ -777,7 +1177,7 @@ function coverageFromReleaseItems(evidence, draft, items, index) {
     .filter((group) => !coveredGroups.has(group.key))
     .map((group) => ({
       short_sha: group.refs.find((ref) => /^[a-f0-9]{7,40}$/.test(ref)) || "",
-      subject: group.subject,
+      subject: (group.subjects || []).join("; "),
       refs: group.refs,
       reason: group.reason || "important local-plugin release source",
     }));
@@ -802,7 +1202,7 @@ function coverageFromReleaseItems(evidence, draft, items, index) {
     covered_refs: coveredRefs.sort(),
     policy:
       previousCoverage.policy ||
-      "important feat/fix/perf/refactor commits must be referenced by at least one bullet source_ref",
+      "every deterministic local-plugin release topic must be referenced by one evidence-backed bullet; all topic source_refs are preserved",
   };
 }
 
@@ -1024,7 +1424,7 @@ function markdownFromReleaseItems(items, coverage) {
     lines.push("");
     lines.push(`### ${category}`);
     for (const item of categoryItems) {
-      lines.push(`- ${item.text_cn}`);
+      lines.push(`- ${item.text_en}`);
     }
   }
   lines.push("");
@@ -1045,11 +1445,14 @@ export function legacyPackageDraftFromEvidence(evidence, { npmDistTag = "" } = {
   const commitCount = Array.isArray(evidence?.commits) ? evidence.commits.length : 0;
   const packageChanges = Array.isArray(evidence?.package_changes) ? evidence.package_changes : [];
   const versionChange = packageChanges.find((item) => item.field === "version");
+  const prerelease = Boolean(parseSemver(targetPackageVersion)?.prerelease) || distTag !== "latest";
   const lines = [
     "## Changelog",
     "",
-    "### Prerelease",
-    `- Published ${PRODUCT_TITLE.en} ${version} as a package prerelease for validation through the npm \`${distTag}\` dist-tag.`,
+    prerelease ? "### Prerelease" : "### Package Release",
+    prerelease
+      ? `- Published ${PRODUCT_TITLE.en} ${version} as a package prerelease for validation through the npm \`${distTag}\` dist-tag.`
+      : `- Published ${PRODUCT_TITLE.en} ${version} through the npm \`${distTag}\` dist-tag.`,
     "",
     "### Release Evidence",
     `- Package tag: ${currentTag}`,
@@ -1061,11 +1464,14 @@ export function legacyPackageDraftFromEvidence(evidence, { npmDistTag = "" } = {
   const previousPackageVersion = versionChange?.before || "unknown";
   lines.push(`- Package version: ${previousPackageVersion} -> ${targetPackageVersion}`);
   lines.push("");
-  lines.push("This legacy prerelease is package-only and does not update the MemOS-Docs Plugin tab.");
+  lines.push(
+    "This prerelease creates an independent local-plugin GitHub Prerelease for traceability. " +
+      "Its release.published event is intentionally ignored by Doc Agent, so it does not update the MemOS-Docs Plugin tab or trigger pre/gray deployment.",
+  );
   return {
     ok: true,
     needs_review: false,
-    confidence: "legacy-package-only",
+    confidence: "standalone-prerelease-no-docs",
     release_items: [],
     coverage: {
       needs_review: false,
@@ -1075,22 +1481,46 @@ export function legacyPackageDraftFromEvidence(evidence, { npmDistTag = "" } = {
       covered_refs: [],
       missing_required: [],
       invalid_item_refs: [],
-      policy: "legacy local-plugin prereleases are package-only and do not create docs payloads",
+      policy:
+        "standalone local-plugin prereleases create npm/tag/GitHub Prerelease metadata but never create docs payloads",
     },
-    warnings: ["legacy package-only prerelease skipped Doc Agent draft and docs payload generation"],
+    warnings: [
+      "standalone prerelease skipped Doc Agent drafting and docs payload generation",
+    ],
     release_notes_markdown: `${lines.join("\n").trim()}\n`,
   };
 }
 
 export function postprocessDraftFromEvidence(draft, evidence) {
-  const inputItems = Array.isArray(draft?.release_items)
-    ? draft.release_items.map(normalizeReleaseItem).filter(Boolean)
-    : [];
-  if (inputItems.length === 0) return draft;
+  const repository = String(process.env.GITHUB_REPOSITORY || "").trim();
+  const rawItems = Array.isArray(draft?.release_items) ? draft.release_items : [];
+  const inputItems = rawItems.map((item) => normalizeReleaseItem(item, repository)).filter(Boolean);
+  const index = buildSourceRefIndex(evidence, repository);
+  const droppedInvalidItems = rawItems.length - inputItems.length;
+  if (inputItems.length === 0) {
+    const coverage = coverageFromReleaseItems(evidence, draft || {}, [], index);
+    const postprocess = releaseNotesPostprocess({ droppedInvalidItems });
+    return {
+      ...(draft || {}),
+      ok: false,
+      needs_review: true,
+      release_items: [],
+      release_categories: {},
+      docs_categories: { cn: {}, en: {} },
+      coverage,
+      warnings: [
+        ...(Array.isArray(draft?.warnings) ? draft.warnings : []),
+        "no valid evidence-backed release items remained after deterministic normalization",
+      ],
+      language_issues: [],
+      postprocess,
+      release_notes_markdown: markdownFromReleaseItems([], coverage),
+    };
+  }
 
-  const index = buildSourceRefIndex(evidence);
+  const canonicalized = canonicalizeEvidenceBackedSourceRefs(inputItems, index);
   let reclassifiedItems = 0;
-  let items = inputItems.map((item) => {
+  let items = canonicalized.items.map((item) => {
     const hintedCategory = bestHintCategoryForItem(item, index);
     const category = hintedCategory || item.category;
     if (category !== item.category) reclassifiedItems += 1;
@@ -1113,23 +1543,44 @@ export function postprocessDraftFromEvidence(draft, evidence) {
     coverage.needs_review = true;
   }
   const { releaseCategories, docsCategories } = categoriesFromReleaseItems(items);
-  const postprocess = {
-    applied: true,
-    removed_duplicate_source_refs: deduped.removedDuplicateRefs,
-    dropped_empty_source_items: deduped.droppedItems,
-    reclassified_items: reclassifiedItems,
-    final_item_count: items.length,
-  };
+  const postprocess = releaseNotesPostprocess({
+    normalizedRefs: canonicalized.normalizedRefs,
+    ambiguousShaRefs: canonicalized.ambiguousShaRefs,
+    unresolvedShaRefs: canonicalized.unresolvedShaRefs,
+    droppedInvalidItems,
+    removedDuplicateRefs: deduped.removedDuplicateRefs,
+    droppedEmptyItems: deduped.droppedItems,
+    reclassifiedItems,
+    finalItemCount: items.length,
+  });
   const warnings = Array.isArray(draft.warnings) ? [...draft.warnings] : [];
+  if (postprocess.dropped_invalid_items > 0) {
+    warnings.push(
+      `${postprocess.dropped_invalid_items} release item(s) were dropped as structurally invalid`,
+    );
+  }
   if (
+    postprocess.normalized_evidence_backed_source_refs > 0 ||
     postprocess.removed_duplicate_source_refs > 0 ||
     postprocess.dropped_empty_source_items > 0 ||
     postprocess.reclassified_items > 0
   ) {
-    warnings.push("release notes were postprocessed to dedupe source_refs and apply evidence category hints");
+    warnings.push(
+      "release notes were postprocessed to normalize evidence-backed numeric SHA refs, dedupe source_refs, and apply evidence category hints",
+    );
   }
   if (languageIssues.length > 0) {
     warnings.push("release notes language validation failed; manual review is required");
+  }
+  if (canonicalized.ambiguousShaRefs.length > 0) {
+    warnings.push(
+      `ambiguous SHA source_refs were left unresolved: ${canonicalized.ambiguousShaRefs.join(", ")}`,
+    );
+  }
+  if (canonicalized.unresolvedShaRefs.length > 0) {
+    warnings.push(
+      `SHA-like source_refs did not resolve to collected evidence: ${canonicalized.unresolvedShaRefs.join(", ")}`,
+    );
   }
 
   return {
@@ -1169,8 +1620,14 @@ export function validateManualNotes(notes) {
     fail("Manual release notes evidence coverage must explicitly set needs_review=false.");
   }
   for (const item of payload.items) {
-    if (!item?.text_cn || !item?.text_en || !Array.isArray(item?.source_refs) || item.source_refs.length === 0) {
-      fail("Every manual release-note item must include text_cn, text_en, and source_refs.");
+    if (
+      !RELEASE_CATEGORY_ORDER.includes(String(item?.category || "")) ||
+      !item?.text_cn ||
+      !item?.text_en ||
+      !Array.isArray(item?.source_refs) ||
+      item.source_refs.length === 0
+    ) {
+      fail("Every manual release-note item must include a valid category, text_cn, text_en, and source_refs.");
     }
     if (!CJK_RE.test(String(item.text_cn || ""))) {
       fail("Every manual release-note item text_cn must contain Chinese text.");
@@ -1182,6 +1639,35 @@ export function validateManualNotes(notes) {
   return text;
 }
 
+export function manualDraftFromNotes(notes, evidence) {
+  const text = validateManualNotes(notes);
+  const match = text.match(/<!--\s*doc-agent-release-notes-json\s*\n([\s\S]*?)\n-->/);
+  const payload = JSON.parse(match[1]);
+  const draft = postprocessDraftFromEvidence(
+    {
+      ok: true,
+      needs_review: false,
+      confidence: "manual-evidence-bound",
+      release_items: payload.items,
+      coverage: payload.coverage,
+      warnings: [],
+    },
+    evidence,
+  );
+  const validationReport = validationReportFromPostprocessedDraft(draft);
+  if (!validationReport.ok) {
+    fail(`Manual release notes failed evidence validation: ${JSON.stringify(validationReport)}`);
+  }
+  return {
+    ...draft,
+    confidence: "manual-evidence-bound",
+    validation_report: validationReport,
+    validation_attempt_count: 1,
+    repair_attempt_count: 0,
+    release_notes_markdown: ensureSourceHint(draft.release_notes_markdown),
+  };
+}
+
 function isRetryableStatus(status) {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
@@ -1189,11 +1675,104 @@ function isRetryableStatus(status) {
 function cleanError(value) {
   return String(value || "")
     .replace(/Bearer\s+\S+/gi, "Bearer ***")
+    .replace(/(?:github_pat_|gh[pousr]_|npm_|xox[baprs]-)[A-Za-z0-9_-]+/gi, "[REDACTED_TOKEN]")
     .replace(/sk-[A-Za-z0-9_-]+/g, "sk-***")
     .replace(/https?:\/\/[^\s"'<>]+/gi, "https://***")
     .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "***")
     .replace(/\s+/g, " ")
-    .slice(0, 600);
+    .slice(0, 1200);
+}
+
+function sanitizeInspectionValue(value) {
+  if (typeof value === "string") return cleanError(value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeInspectionValue(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, sanitizeInspectionValue(item)]),
+    );
+  }
+  return value;
+}
+
+function draftReviewSummary(payload) {
+  const coverage = payload?.coverage || {};
+  return {
+    needs_review: Boolean(payload?.needs_review || coverage.needs_review),
+    required_count: Number(coverage.required_count || 0),
+    covered_required_count: Number(coverage.covered_required_count || 0),
+    missing_required_count: Number(coverage.missing_required_count || 0),
+    invalid_item_ref_count: Array.isArray(coverage.invalid_item_refs)
+      ? coverage.invalid_item_refs.length
+      : 0,
+    items_missing_source_refs_count: Array.isArray(coverage.items_missing_source_refs)
+      ? coverage.items_missing_source_refs.length
+      : 0,
+    item_count: Array.isArray(payload?.release_items) ? payload.release_items.length : 0,
+    quality_issues: Array.isArray(coverage.quality_issues)
+      ? coverage.quality_issues.map((item) => cleanError(item))
+      : [],
+    warnings: Array.isArray(payload?.warnings)
+      ? payload.warnings.map((item) => cleanError(item))
+      : [],
+  };
+}
+
+export function writeDraftFailureInspection({ evidence, payload, error }) {
+  const runnerTemp = String(process.env.RUNNER_TEMP || "").trim();
+  const directory =
+    String(process.env.RELEASE_NOTES_FAILURE_DIR || "").trim() ||
+    join(runnerTemp || tmpdir(), "memos-local-plugin-release-notes-failure");
+  mkdirSync(directory, { recursive: true });
+  const safeDraft = draftForInspection(payload || {});
+  const summary = draftReviewSummary(payload || {});
+  const failure = {
+    schema: "memos.local-plugin.release-notes-failure.v1",
+    ok: false,
+    phase: "release-notes",
+    error: cleanError(error?.message || error),
+    ...summary,
+  };
+  writeFileSync(join(directory, "evidence.json"), JSON.stringify(evidenceForInspection(evidence), null, 2), "utf8");
+  writeFileSync(join(directory, "release-notes-draft.json"), JSON.stringify(safeDraft, null, 2), "utf8");
+  writeFileSync(join(directory, "quality-report.json"), JSON.stringify(failure, null, 2), "utf8");
+  writeFileSync(
+    join(directory, "README.md"),
+    [
+      "# MemOS local plugin release-notes failure",
+      "",
+      "Publishing stopped before npm, tag, and GitHub Release side effects.",
+      "",
+      `- required sources: ${summary.covered_required_count}/${summary.required_count}`,
+      `- generated items: ${summary.item_count}`,
+      `- missing source refs: ${summary.items_missing_source_refs_count}`,
+      `- invalid source refs: ${summary.invalid_item_ref_count}`,
+      `- quality issues: ${summary.quality_issues.length}`,
+      "",
+      "Inspect quality-report.json, release-notes-draft.json, and the redacted evidence.json.",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  return directory;
+}
+
+// Rejection makes a best-effort sanitized inspection write without masking validation failures.
+export function requireValidatedDraft({ evidence, draft }) {
+  if (draft?.ok && !draft?.needs_review) return draft;
+  let summary = "{}";
+  try {
+    summary = JSON.stringify(draft?.validation_report || draft?.coverage || {});
+  } catch {
+    summary = "{\"summary_unavailable\":true}";
+  }
+  const error = new Error(`Postprocessed release notes require review: ${summary}`);
+  try {
+    writeDraftFailureInspection({ evidence, payload: draft || {}, error });
+  } catch {
+    // Intentional: diagnostic artifact failures must never hide the validation error.
+    warn("Failed to write release-note failure diagnostics; preserving the original validation error.");
+  }
+  throw error;
 }
 
 function requiredUrlFromEnv(name) {
@@ -1319,9 +1898,7 @@ export async function requestDraft(
       }
       if (!payload.ok || payload.needs_review) {
         const serverAttempts = Array.isArray(payload.attempts) ? payload.attempts : [];
-        const coverage = payload.coverage ? JSON.stringify(payload.coverage) : "";
-        const warnings = Array.isArray(payload.warnings) ? payload.warnings.join("; ") : "";
-        const message = `Release notes draft needs review. ${coverage} ${warnings}`.trim();
+        const message = `Release notes draft needs review: ${JSON.stringify(draftReviewSummary(payload))}`;
         if (serverAttempts.length >= 3) {
           await reportFailure({
             evidence,
@@ -1334,7 +1911,11 @@ export async function requestDraft(
             fetchImpl,
           });
         }
-        fail(message);
+        throw Object.assign(new Error(message), {
+          retryable: false,
+          errorCode: "DRAFT_VALIDATION",
+          draftPayload: payload,
+        });
       }
       if (!String(payload.release_notes_markdown || "").trim()) {
         fail("Release-notes draft service returned an empty release_notes_markdown.");
@@ -1351,7 +1932,10 @@ export async function requestDraft(
         if (attempts.length === 3) {
           await reportFailure({ evidence, attempts, finalError: entry.message, fetchImpl });
         }
-        fail(`Release-notes draft request failed on attempt ${attempt}: ${entry.message}`);
+        throw Object.assign(
+          new Error(`Release-notes draft request failed on attempt ${attempt}: ${entry.message}`),
+          { draftPayload: error?.draftPayload },
+        );
       }
       warn(`Release-notes draft attempt ${attempt} failed; retrying: ${entry.message}`);
       await sleep(250 * 2 ** (attempt - 1));
@@ -1366,26 +1950,16 @@ export async function main() {
 
   const currentTag = process.env.RELEASE_TAG || `${CURRENT_TAG_PREFIX}${targetVersion}`;
   const npmDistTag = String(process.env.NPM_DIST_TAG || "").trim();
-  const legacyPackageOnly = isLegacyPackageOnlyRelease({ targetVersion, npmDistTag });
+  const forcePackageOnly = String(process.env.FORCE_PACKAGE_ONLY_RELEASE || "").trim() === "true";
+  const legacyPackageOnly = isLegacyPackageOnlyRelease({ targetVersion, npmDistTag, forcePackageOnly });
+  const includePrereleaseBaseline = isLegacyPackageOnlyRelease({ targetVersion, npmDistTag });
   const notesPath =
     process.env.RELEASE_NOTES_FILE ||
     join(tmpdir(), `memos-local-plugin-${targetVersion}-release-notes.md`);
   mkdirSync(dirname(notesPath), { recursive: true });
 
-  const manualNotes = String(process.env.MANUAL_RELEASE_NOTES || "").trim();
-  if (manualNotes) {
-    const notes = legacyPackageOnly
-      ? validateLegacyPackageNotes(manualNotes)
-      : ensureSourceHint(validateManualNotes(manualNotes));
-    writeFileSync(notesPath, notes, "utf8");
-    appendOutput("release_notes_file", notesPath);
-    appendOutput("draft_used", "false");
-    console.log(`Using manually provided release notes: ${notesPath}`);
-    return;
-  }
-
   const previousTag = findPreviousTag(targetVersion, currentTag, {
-    includePrerelease: legacyPackageOnly,
+    includePrerelease: includePrereleaseBaseline,
   });
   if (!previousTag) {
     fail(`Cannot find a previous local plugin tag before ${currentTag}.`);
@@ -1395,6 +1969,32 @@ export async function main() {
   const evidence = collectEvidence({ targetVersion, currentTag, previousTag, currentRef });
   const evidencePath = join(tmpdir(), `memos-local-plugin-${targetVersion}-evidence.json`);
   writeFileSync(evidencePath, JSON.stringify(evidenceForInspection(evidence), null, 2), "utf8");
+
+  const manualNotes = String(process.env.MANUAL_RELEASE_NOTES || "").trim();
+  if (manualNotes) {
+    const draft = legacyPackageOnly
+      ? legacyPackageDraftFromEvidence(evidence, { npmDistTag })
+      : manualDraftFromNotes(manualNotes, evidence);
+    const notes = legacyPackageOnly
+      ? validateLegacyPackageNotes(manualNotes)
+      : draft.release_notes_markdown;
+    const draftPath = join(tmpdir(), `memos-local-plugin-${targetVersion}-release-notes-draft.json`);
+    writeFileSync(draftPath, JSON.stringify(draftForInspection(draft), null, 2), "utf8");
+    writeFileSync(notesPath, notes, "utf8");
+    appendOutput("release_notes_file", notesPath);
+    appendOutput("evidence_file", evidencePath);
+    appendOutput("draft_file", draftPath);
+    appendOutput("draft_used", legacyPackageOnly ? "false" : "true");
+    appendOutput("previous_tag", previousTag);
+    appendOutput("current_tag", currentTag);
+    appendOutput("current_ref", currentRef);
+    appendOutput("draft_confidence", draft.confidence);
+    appendOutput("missing_required_count", String(draft.coverage?.missing_required_count ?? ""));
+    appendOutput("validation_attempt_count", String(draft.validation_attempt_count ?? 0));
+    appendOutput("repair_attempt_count", String(draft.repair_attempt_count ?? 0));
+    console.log(`Using manually provided evidence-bound release notes: ${notesPath}`);
+    return;
+  }
 
   if (legacyPackageOnly) {
     const draft = legacyPackageDraftFromEvidence(evidence, { npmDistTag });
@@ -1414,17 +2014,25 @@ export async function main() {
     appendOutput("validation_attempt_count", "0");
     appendOutput("repair_attempt_count", "0");
 
-    console.log(`Generated package-only prerelease notes without Doc Agent: ${notesPath}`);
+    console.log(`Generated standalone package inspection notes without Doc Agent: ${notesPath}`);
     console.log(`Previous tag: ${previousTag}`);
     console.log(`Current tag: ${currentTag}`);
     console.log(`Current evidence ref: ${currentRef}`);
     return;
   }
 
-  const draft = await requestValidatedDraft(evidence);
-  if (!draft.ok || draft.needs_review) {
-    fail(`Postprocessed release notes require review: ${JSON.stringify(draft.validation_report || draft.coverage || {})}`);
+  let draft;
+  try {
+    draft = await requestValidatedDraft(evidence);
+  } catch (error) {
+    writeDraftFailureInspection({
+      evidence,
+      payload: error?.draftPayload || {},
+      error,
+    });
+    throw error;
   }
+  draft = requireValidatedDraft({ evidence, draft });
   const draftPath = join(tmpdir(), `memos-local-plugin-${targetVersion}-release-notes-draft.json`);
   writeFileSync(draftPath, JSON.stringify(draftForInspection(draft), null, 2), "utf8");
   writeFileSync(notesPath, ensureSourceHint(draft.release_notes_markdown), "utf8");

@@ -6,6 +6,16 @@
 
 import type { ResolvedConfig } from "./schema.js";
 
+const FIXED_VIEWER_PORTS: Readonly<Record<string, number>> = Object.freeze({
+  openclaw: 18799,
+  hermes: 18800,
+});
+
+/** Runtime adapters own these well-known ports even for legacy YAML files. */
+export function effectiveViewerPort(agent?: string): number | undefined {
+  return agent ? FIXED_VIEWER_PORTS[agent] : undefined;
+}
+
 export const DEFAULT_CONFIG: ResolvedConfig = {
   version: 1,
   viewer: {
@@ -30,6 +40,8 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     providerIgnore: [],
     providerOrder: [],
     openRouter: false,
+    maxInputTokens: 1_024,
+    batchSize: 32,
     cache: {
       enabled: true,
       maxItems: 20_000,
@@ -47,6 +59,8 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     providerIgnore: [],
     providerOrder: [],
     openRouter: false,
+    maxTokens: 1024,
+    headers: {},
   },
   l3Llm: {
     // Empty by default — falls back to the shared `llm` settings.
@@ -63,6 +77,8 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     providerIgnore: [],
     providerOrder: [],
     openRouter: false,
+    maxTokens: 4096,
+    headers: {},
   },
   skillEvolver: {
     // Empty by default — falls back to the shared `llm` settings.
@@ -77,6 +93,8 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     providerIgnore: [],
     providerOrder: [],
     openRouter: false,
+    maxTokens: 4096,
+    headers: {},
   },
   storage: {
     ftsTokenizer: "trigram",
@@ -204,6 +222,8 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
       // an early-life install can still cluster into a world model;
       // strict 0.6 starved L3 in real usage.
       clusterMinSimilarity: 0.3,
+      maxPoliciesPerCluster: 20,
+      maxPromptChars: 32_000,
       policyCharCap: 800,
       traceCharCap: 500,
       traceEvidencePerPolicy: 1,
@@ -231,15 +251,16 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
       // real usage; 1 lets the candidate→active transition happen
       // immediately on first successful invocation.
       candidateTrials: 1,
-      // Lowered from 6 hours → 0: no cooldown, skills can re-evolve
-      // as soon as new evidence arrives.
-      cooldownMs: 0,
+      // Verification failures are retried after six hours by default;
+      // operators may set this to 0 when immediate re-evaluation is desired.
+      cooldownMs: 6 * 60 * 60 * 1000,
       traceCharCap: 500,
       evidenceLimit: 6,
       useLlm: true,
       etaDelta: 0.1,
       archiveEta: 0.1,
       minEtaForRetrieval: 0.1,
+      idleArchiveMs: 30 * 24 * 60 * 60 * 1000,
     },
     feedback: {
       failureThreshold: 3,
@@ -342,6 +363,19 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
     channels: {},
   },
 };
+
+/**
+ * Object-valued config slots whose child keys are user-defined rather than
+ * fields in `DEFAULT_CONFIG`. Keep this list explicit: treating every empty
+ * default object as a free-form map would silently disable unknown-key
+ * warnings for any future structured config section that starts out empty.
+ */
+export const FREE_FORM_CONFIG_PATHS: readonly string[] = Object.freeze([
+  "llm.headers",
+  "l3Llm.headers",
+  "skillEvolver.headers",
+  "logging.channels",
+]);
 
 /**
  * Set of dotted-path field names whose values must never be sent to the

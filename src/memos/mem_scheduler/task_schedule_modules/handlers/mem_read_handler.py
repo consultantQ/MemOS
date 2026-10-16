@@ -202,8 +202,8 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                     )
                 processed_memories = observation.value
             except Exception as e:
-                logger.warning("%s: Fail to transfer mem: %s", e, memory_items)
-                processed_memories = []
+                logger.warning("%s: Fail to transfer mem: %s", e, memory_items, exc_info=True)
+                return
 
             if processed_memories and len(processed_memories) > 0:
                 flattened_memories = []
@@ -241,7 +241,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                             for memory in flattened_memories
                             if memory.metadata.memory_type == "RawFileMemory"
                         ]
-                        text_mem.add_rawfile_nodes_n_edges(
+                        text_mem.add_rawfile_nodes(
                             raw_file_mem_group,
                             enhanced_mem_ids,
                             user_id=user_id,

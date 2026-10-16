@@ -56,6 +56,7 @@ import type {
   PipelineBuses,
   PipelineDeps,
   PipelineHandle,
+  PipelineShutdownOptions,
   RecordToolOutcomeInput,
   TurnEndResult,
 } from "./types.js";
@@ -83,29 +84,40 @@ import { onBroadcastLog } from "../logger/transports/sse-broadcast.js";
 import { createEmbeddingRetryWorker, systemErrorEvent } from "../embedding/index.js";
 import type { EpisodeSnapshot } from "../session/index.js";
 import type { IntentDecision, RelationDecision, TurnRelation } from "../session/types.js";
+import {
+  createForegroundResources,
+  prioritizeEmbedder,
+} from "../util/foreground-resources.js";
+import { createRequestDeadline } from "../util/request-deadline.js";
+import { createSkillLifecycleWorker } from "../skill/lifecycle-worker.js";
 
 function classifyWithTimeout(
   classifyFn: () => Promise<RelationDecision>,
   timeoutMs: number,
   log: Logger,
 ): Promise<RelationDecision> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
   return Promise.race([
     classifyFn(),
-    new Promise<RelationDecision>((_, reject) =>
-      setTimeout(() => reject(new Error("classify_timeout")), timeoutMs),
-    ),
-  ]).catch((err) => {
-    log.warn("relation.classify_timeout", {
-      timeoutMs,
-      err: err instanceof Error ? err.message : String(err),
+    new Promise<RelationDecision>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("classify_timeout")), timeoutMs);
+    }),
+  ])
+    .catch((err) => {
+      log.warn("relation.classify_timeout", {
+        timeoutMs,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        relation: "follow_up" as const,
+        confidence: 0,
+        reason: "classify_timeout",
+        signals: ["classify_timeout"],
+      };
+    })
+    .finally(() => {
+      if (timer) clearTimeout(timer);
     });
-    return {
-      relation: "new_task" as const,
-      confidence: 0,
-      reason: "classify_timeout",
-      signals: ["classify_timeout"],
-    };
-  });
 }
 
 // ─── Factory ──────────────────────────────────────────────────────────────
@@ -115,6 +127,12 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
   const algorithm = extractAlgorithmConfig(deps);
   const lightweightMode = algorithm.lightweightMemory.enabled;
   const buses = buildPipelineBuses();
+  const foregroundResources = createForegroundResources();
+  const backgroundEmbedder = prioritizeEmbedder(
+    deps.embedder,
+    foregroundResources,
+    "background",
+  );
 
   // Session + intent.
   const session = buildPipelineSession(deps, buses.session);
@@ -123,7 +141,13 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
   // Pass `session` so the reward runner's `getEpisodeSnapshot` hook
   // can resolve the live, in-memory episode (with turns populated)
   // rather than falling back to the empty row from SQLite.
-  const subs = buildPipelineSubscribers(deps, buses, algorithm, session);
+  const subs = buildPipelineSubscribers(
+    deps,
+    buses,
+    algorithm,
+    session,
+    foregroundResources,
+  );
 
   // Core-event aggregator. Every internal bus funnels into one stream.
   const eventListeners = new Set<(e: CoreEvent) => void>();
@@ -160,7 +184,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
   let retryEventSeq = 1_000_000;
   const embeddingRetryWorker = createEmbeddingRetryWorker({
     repos: deps.repos,
-    embedder: deps.embedder,
+    embedder: backgroundEmbedder,
     log: log.child({ channel: "core.embedding.retry" }),
     now: deps.now,
     onSystemError: (payload, correlationId) => {
@@ -285,6 +309,12 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     log,
     emit: emitCore,
   });
+  const skillLifecycleWorker = createSkillLifecycleWorker({
+    runLifecycle: () => subs.skills.lifecycleTick(),
+    log: log.child({ channel: "core.skill.lifecycle-worker" }),
+    now: deps.now,
+  });
+  if (!lightweightMode) skillLifecycleWorker.start();
 
   // In-memory index of the open episode per session so we can route
   // `addTurn` calls without a repo round-trip.
@@ -366,6 +396,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     userText: string,
     meta: Record<string, unknown>,
     turnTs?: number,
+    signal?: AbortSignal,
   ): Promise<EpisodeSnapshot> {
     const currentEpId = openEpisodeBySession.get(sessionId);
     if (currentEpId) {
@@ -387,6 +418,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
       userMessage: userText,
       ts: turnTs,
       meta: lightweightEpisodeMeta(meta),
+      signal,
     });
     openEpisodeBySession.set(sessionId, snap.id as EpisodeId);
     return snap;
@@ -433,13 +465,20 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     userText: string,
     meta: Record<string, unknown>,
     agent: AgentKind,
+    signal?: AbortSignal,
   ): Promise<{ episode: EpisodeSnapshot; sessionId: SessionId; relation?: string }> {
     const mergeMode = algorithm.session.followUpMode === "merge_follow_ups";
     const mergeCapMs = algorithm.session.mergeMaxGapMs;
     const turnTs = timestampFromMeta(meta, "startedAtTurnTs");
 
     if (lightweightMode) {
-      const snap = await startLightweightEpisode(sessionId, userText, meta, turnTs);
+      const snap = await startLightweightEpisode(
+        sessionId,
+        userText,
+        meta,
+        turnTs,
+        signal,
+      );
       return { episode: snap, sessionId, relation: "lightweight_memory" };
     }
 
@@ -465,6 +504,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
             newUserText: userText,
             gapMs,
             prevEpisodeId: currentEpId,
+            signal,
           }),
           algorithm.session.classifyTimeoutMs,
           log,
@@ -582,6 +622,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
             userMessage: userText,
             ts: turnTs,
             meta: { ...meta, relation: "new_task" },
+            signal,
           });
           openEpisodeBySession.set(sessionId, snap.id as EpisodeId);
           return { episode: snap, sessionId, relation: decision.relation };
@@ -601,6 +642,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
           userMessage: userText,
           ts: turnTs,
           meta: { ...meta, relation: decision.relation, gapMs },
+          signal,
         });
         openEpisodeBySession.set(sessionId, fresh.id as EpisodeId);
         return { episode: fresh, sessionId, relation: decision.relation };
@@ -645,6 +687,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
               newUserText: userText,
               gapMs,
               prevEpisodeId: snapshot.id as EpisodeId,
+              signal,
             }),
             algorithm.session.classifyTimeoutMs,
             log,
@@ -748,6 +791,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
         userMessage: userText,
         ts: turnTs,
         meta,
+        signal,
       });
       openEpisodeBySession.set(sessionId, snap.id as EpisodeId);
       return { episode: snap, sessionId, relation: "bootstrap" };
@@ -762,6 +806,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
         newUserText: userText,
         gapMs,
         prevEpisodeId: prev.episodeId,
+        signal,
       }),
       algorithm.session.classifyTimeoutMs,
       log,
@@ -861,6 +906,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
         userMessage: userText,
         ts: turnTs,
         meta: { ...meta, relation: "new_task" },
+        signal,
       });
       openEpisodeBySession.set(sessionId, snap.id as EpisodeId);
       return { episode: snap, sessionId, relation: decision.relation };
@@ -871,6 +917,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
       userMessage: userText,
       ts: turnTs,
       meta: { ...meta, relation: decision.relation },
+      signal,
     });
     openEpisodeBySession.set(sessionId, snap.id as EpisodeId);
     return { episode: snap, sessionId, relation: decision.relation };
@@ -1043,7 +1090,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
 
   // ─── Retrieval entry points ─────────────────────────────────────────────
 
-  const retrievalDeps = buildRetrievalDeps(deps, algorithm);
+  const retrievalDeps = buildRetrievalDeps(deps, algorithm, foregroundResources);
   const turnStartRetrievalStats = new Map<string, RetrievalResult["stats"]>();
 
   function retrievalDepsFor(namespace = deps.namespace): typeof retrievalDeps {
@@ -1057,6 +1104,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
   async function retrieveTurnStart(
     input: TurnInputDTO,
     plan?: RetrievePlan,
+    signal?: AbortSignal,
   ): Promise<InjectionPacket> {
     const ctx = {
       reason: "turn_start" as const,
@@ -1073,6 +1121,9 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
       {
         events: buses.retrieval,
         skipLlmFilter: input.contextHints?.__memosDeferLlmFilterToCaller === true,
+        signal,
+        deadlineAt: input.deadlineAt,
+        llmFilterMalformedRetries: input.llmFilterMalformedRetries,
         plan: plan
           ? {
               scenarioId: plan.scenarioId,
@@ -1175,13 +1226,86 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
   }
 
   async function onTurnStartOnce(input: TurnInputDTO): Promise<InjectionPacket> {
+    const leaveForeground = foregroundResources.enterForeground();
+    const deadline =
+      input.deadlineAt === undefined
+        ? null
+        : createRequestDeadline(input.deadlineAt);
+    const startedAt = Date.now();
+    let stage = "ensure_session";
+    try {
+      return await onTurnStartForeground(input, deadline?.signal, (next) => {
+        stage = next;
+      });
+    } finally {
+      if (deadline?.signal.aborted) {
+        log.warn("turn.start.deadline_exceeded", {
+          sessionId: input.sessionId,
+          deadlineAt: input.deadlineAt,
+          elapsedMs: Date.now() - startedAt,
+          stage,
+        });
+      }
+      deadline?.dispose();
+      leaveForeground();
+    }
+  }
+
+  /**
+   * Prompt-time retrieval for hosts that keep lifecycle enrichment eventually
+   * consistent. This deliberately performs no session/episode writes and no
+   * relation or intent classification.
+   */
+  async function recallTurn(
+    input: TurnInputDTO,
+    externalSignal?: AbortSignal,
+  ): Promise<InjectionPacket> {
+    const leaveForeground = foregroundResources.enterForeground();
+    const deadline =
+      input.deadlineAt === undefined
+        ? null
+        : createRequestDeadline(input.deadlineAt);
+    const startedAt = Date.now();
+    try {
+      const requestSignal = deadline && externalSignal
+        ? AbortSignal.any([deadline.signal, externalSignal])
+        : deadline?.signal ?? externalSignal;
+      return await retrieveTurnStart(input, undefined, requestSignal);
+    } finally {
+      if (deadline?.signal.aborted) {
+        log.warn("turn.recall.deadline_exceeded", {
+          sessionId: input.sessionId,
+          deadlineAt: input.deadlineAt,
+          elapsedMs: Date.now() - startedAt,
+        });
+      }
+      deadline?.dispose();
+      leaveForeground();
+    }
+  }
+
+  interface PreparedTurn {
+    t0: number;
+    sessionId: SessionId;
+    episode: EpisodeSnapshot;
+    normalized: TurnInputDTO;
+    retrievePlan: RetrievePlan;
+  }
+
+  async function prepareTurnInternal(
+    input: TurnInputDTO,
+    signal?: AbortSignal,
+    setStage: (stage: string) => void = () => {},
+  ): Promise<PreparedTurn> {
     const t0 = now();
+    setStage("ensure_session");
     const initialSessionId = await ensureSession(
       input.agent,
       input.sessionId,
       input.contextHints,
     );
 
+    setStage("relation_and_episode");
     const routing = await openEpisodeIfNeeded(
       initialSessionId,
       input.userText,
@@ -1192,6 +1316,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
         startedAtTurnTs: input.ts,
       },
       input.agent,
+      signal,
     );
 
     const sessionId = routing.sessionId;
@@ -1203,10 +1328,12 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
       sessionId,
       episodeId: episode.id as EpisodeId,
     };
+    setStage("intent");
     const schedulerIntent = await intentForCurrentTurn({
       episode,
       userText: input.userText,
       ts: input.ts,
+      signal,
     });
     const retrievePlan = scheduleInjection({
       userText: input.userText,
@@ -1215,6 +1342,27 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
       intent: schedulerIntent,
       relation: schedulerRelation(routing.relation),
     });
+    return { t0, sessionId, episode, normalized, retrievePlan };
+  }
+
+  /** Resolve turn routing in the caller's background queue, without retrieval. */
+  async function prepareTurn(
+    input: TurnInputDTO,
+  ): Promise<{ sessionId: SessionId; episodeId: EpisodeId }> {
+    const prepared = await prepareTurnInternal(input);
+    return {
+      sessionId: prepared.sessionId,
+      episodeId: prepared.episode.id as EpisodeId,
+    };
+  }
+
+  async function onTurnStartForeground(
+    input: TurnInputDTO,
+    signal?: AbortSignal,
+    setStage: (stage: string) => void = () => {},
+  ): Promise<InjectionPacket> {
+    const prepared = await prepareTurnInternal(input, signal, setStage);
+    const { t0, sessionId, episode, normalized, retrievePlan } = prepared;
 
     try {
       if (retrievePlan.entry === "turn_start_skip") {
@@ -1240,10 +1388,13 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
           retrievalTotalMs: 0,
           elapsedMs: now() - t0,
         });
+        setStage("complete");
         return packet;
       }
 
-      const packet = await retrieveTurnStart(normalized, retrievePlan);
+      setStage("retrieval");
+      const packet = await retrieveTurnStart(normalized, retrievePlan, signal);
+      setStage("complete");
       // Always stamp the routed sessionId + episodeId on the packet so
       // adapters can correlate the subsequent `agent_end` / `turn.end`
       // call without needing a separate round-trip to the session
@@ -1423,6 +1574,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
       toolCalls: result.toolCalls.length,
       agentChars: result.agentText.length,
     });
+    skillLifecycleWorker.trigger();
 
     // The episode stays OPEN — finalize is deferred to topic end.
     return {
@@ -1495,19 +1647,44 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     await subs.l3.drain();
     await nextTick();
     await subs.skills.flush();
-    await subs.skills.lifecycleTick();
+    await skillLifecycleWorker.runNow();
     await subs.feedback.flush();
     await embeddingRetryWorker.flush();
   }
 
-  async function shutdown(reason: string = "shutdown"): Promise<void> {
+  async function shutdown(
+    reason: string = "shutdown",
+    options: PipelineShutdownOptions = {},
+  ): Promise<void> {
     log.info("pipeline.shutdown.begin", { reason });
+    // Stop admitting retry jobs, but preserve a bounded grace period for raw
+    // capture and downstream enrichment. Hermes' bridge owns a 20s outer
+    // shutdown ceiling, so abort before that rather than either hanging or
+    // discarding every single-shot session's enrichment immediately.
+    skillLifecycleWorker.stop();
+    embeddingRetryWorker.stop();
+    const flushGraceMs = Math.max(0, options.flushGraceMs ?? 15_000);
+    const abortWaitMs = Math.max(0, options.abortWaitMs ?? 4_000);
+    if (flushGraceMs === 0) {
+      foregroundResources.shutdown(reason);
+    }
+    const flushPromise = flush();
     try {
-      await flush();
+      const completed = await settlesWithin(flushPromise, flushGraceMs);
+      if (!completed) {
+        log.warn("pipeline.flush_timeout", { reason, timeoutMs: flushGraceMs });
+        foregroundResources.shutdown(reason);
+        const aborted = await settlesWithin(flushPromise, abortWaitMs);
+        if (!aborted) {
+          log.warn("pipeline.flush_abandoned", { reason, abortWaitMs });
+        }
+      }
     } catch (err) {
       log.warn("pipeline.flush_failed", {
         err: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      foregroundResources.shutdown(reason);
     }
     // Detach subscribers — prevents late events from re-queuing work.
     subs.subscriptions.capture.stop();
@@ -1516,11 +1693,24 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     subs.l3.detach();
     subs.skills.dispose();
     subs.feedback.dispose();
-    embeddingRetryWorker.stop();
     bridge.dispose();
     logSubscription();
     session.sessionManager.shutdown(reason);
     log.info("pipeline.shutdown.done", { reason });
+  }
+
+  async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   function now(): number {
@@ -1589,6 +1779,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     episode: EpisodeSnapshot;
     userText: string;
     ts?: number;
+    signal?: AbortSignal;
   }): Promise<IntentDecision> {
     const firstTurn = input.episode.turns[0];
     const isFreshEpisodeForThisTurn =
@@ -1603,6 +1794,7 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
 
     return session.intent.classify(input.userText, {
       episodeId: input.episode.id as EpisodeId,
+      signal: input.signal,
     });
   }
 
@@ -1672,6 +1864,9 @@ export function createPipeline(deps: PipelineDeps): PipelineHandle {
     getRecentEvents,
     subscribeLogs,
     onTurnStart,
+    recallTurn,
+    enterForeground: () => foregroundResources.enterForeground(),
+    prepareTurn,
     consumeRetrievalStats,
     onTurnEnd,
     recordToolOutcome,

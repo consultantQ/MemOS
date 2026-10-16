@@ -101,6 +101,10 @@ import type {
 import { wrapRetrievalRepos } from "./retrieval-repos.js";
 import { createSemaphore } from "../util/semaphore.js";
 import { rateLimitLlmClient } from "../util/rate-limited-llm.js";
+import {
+  prioritizeEmbedder,
+  type ForegroundResources,
+} from "../util/foreground-resources.js";
 
 // ─── Algorithm config slice helper ────────────────────────────────────────
 
@@ -208,26 +212,29 @@ export function buildPipelineSubscribers(
   buses: PipelineBuses,
   algorithm: PipelineAlgorithmConfig,
   session?: PipelineSessionSet,
+  resources?: ForegroundResources,
 ): PipelineSubscriberSet {
   const log = deps.log ?? rootLogger.child({ channel: "core.pipeline" });
   const bgLlmSemaphore = createSemaphore(algorithm.session.bgLlmConcurrency);
-  const bgLlm = rateLimitLlmClient(deps.llm, bgLlmSemaphore);
-  const bgReflectLlm = rateLimitLlmClient(deps.reflectLlm, bgLlmSemaphore);
-  const bgL3Llm = rateLimitLlmClient(deps.l3Llm ?? deps.llm, bgLlmSemaphore);
+  const bgLlm = rateLimitLlmClient(deps.llm, bgLlmSemaphore, resources);
+  const bgEvolverLlm = rateLimitLlmClient(deps.reflectLlm ?? deps.llm, bgLlmSemaphore, resources);
+  const bgL3Llm = rateLimitLlmClient(deps.l3Llm ?? deps.llm, bgLlmSemaphore, resources);
+  const bgEmbedder = resources
+    ? prioritizeEmbedder(deps.embedder, resources, "background")
+    : deps.embedder;
   const lightweightMode = algorithm.lightweightMemory.enabled;
 
   const captureRunner = createCaptureRunner({
     tracesRepo: deps.repos.traces,
     embeddingRetryQueue: deps.repos.embeddingRetryQueue,
     episodesRepo: adaptEpisodesRepo(deps.repos.episodes),
-    embedder: deps.embedder,
+    embedder: bgEmbedder,
     llm: bgLlm,
     // Issue #2148: capture batch reflection emits JSON, so it must use
     // the main model rather than the potentially thinking-enabled
     // skill-evolver model. Keep the background wrapper so capture also
-    // participates in the shared concurrency limit. `bgReflectLlm`
-    // remains read-only evaluator metadata below; the original
-    // `deps.reflectLlm` is also exposed to the Overview health card.
+    // participates in the shared concurrency limit. The dedicated
+    // evolver client is used by L2 induction and skill crystallization.
     reflectLlm: bgLlm,
     bus: buses.capture,
     cfg: algorithm.capture,
@@ -268,8 +275,8 @@ export function buildPipelineSubscribers(
     bus: buses.reward,
     cfg: algorithm.reward,
     evaluator: {
-      reflectionProvider: bgReflectLlm?.provider,
-      reflectionModel: bgReflectLlm?.model,
+      reflectionProvider: bgLlm?.provider,
+      reflectionModel: bgLlm?.model,
       scorerProvider: bgLlm?.provider,
       scorerModel: bgLlm?.model,
     },
@@ -303,7 +310,7 @@ export function buildPipelineSubscribers(
     repos: deps.repos,
     rewardBus: buses.reward,
     l2Bus: buses.l2,
-    llm: bgLlm,
+    llm: bgEvolverLlm,
     log: log.child({ channel: "core.memory.l2" }),
     config: algorithm.l2Induction,
     thresholds: {
@@ -327,8 +334,8 @@ export function buildPipelineSubscribers(
 
   const skillHandle = attachSkillSubscriber({
     repos: deps.repos,
-    embedder: deps.embedder,
-    llm: bgLlm,
+    embedder: bgEmbedder,
+    llm: bgEvolverLlm,
     bus: buses.skill,
     l2Bus: buses.l2,
     rewardBus: buses.reward,
@@ -339,7 +346,7 @@ export function buildPipelineSubscribers(
   const feedbackHandle = attachFeedbackSubscriber({
     repos: deps.repos,
     llm: bgLlm,
-    embedder: deps.embedder,
+    embedder: bgEmbedder,
     bus: buses.feedback,
     log: log.child({ channel: "core.feedback" }),
     config: algorithm.feedback,
@@ -404,14 +411,17 @@ export function buildPipelineSession(
 export function buildRetrievalDeps(
   deps: PipelineDeps,
   algorithm: PipelineAlgorithmConfig,
+  resources?: ForegroundResources,
 ): RetrievalDeps {
-  const embedder = deps.embedder;
+  const embedder = resources
+    ? prioritizeEmbedder(deps.embedder, resources, "foreground")
+    : deps.embedder;
   return {
     repos: wrapRetrievalRepos(deps.repos, deps.namespace),
     embedder: embedder
       ? {
-          embed: (text, role) =>
-            embedder.embedOne({ text, role: role ?? "query" }),
+          embed: (text, role, options) =>
+            embedder.embedOne({ text, role: role ?? "query" }, options),
         }
       : {
           // Degraded mode: empty vector so vector-scoring falls back to
