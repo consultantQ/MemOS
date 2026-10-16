@@ -77,6 +77,74 @@ afterEach(async () => {
 });
 
 describe("pipeline/orchestrator", () => {
+  it("degrades retrieval at the adapter deadline and aborts the provider call", async () => {
+    const base = fakeEmbedder({ dimensions: 384 });
+    let sawAbort = false;
+    const embedder = {
+      ...base,
+      async embedOne(input: Parameters<typeof base.embedOne>[0], options?: { signal?: AbortSignal }) {
+        return await new Promise<Awaited<ReturnType<typeof base.embedOne>>>((resolve, reject) => {
+          const onAbort = () => {
+            sawAbort = true;
+            reject(new DOMException("deadline", "AbortError"));
+          };
+          if (options?.signal?.aborted) return onAbort();
+          options?.signal?.addEventListener("abort", onAbort, { once: true });
+          void resolve;
+        });
+      },
+    };
+    pipeline = createPipeline(buildDeps(dbHandle!, embedder));
+    const startedAt = Date.now();
+
+    const packet = await pipeline.onTurnStart({
+      agent: "hermes",
+      sessionId: "s-deadline",
+      userText: "find the previous build decision",
+      ts: Date.now(),
+      deadlineAt: Date.now() + 25,
+    });
+
+    expect(sawAbort).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(packet.reason).toBe("turn_start");
+  });
+
+  it("recalls a turn without opening or routing a session", async () => {
+    pipeline = createPipeline(buildDeps(dbHandle!));
+
+    const packet = await pipeline.recallTurn({
+      agent: "deepseek-harness",
+      sessionId: "s-recall-only",
+      userText: "find the previous repository build decision",
+      ts: 1_700_000_000_000,
+    });
+
+    expect(packet.reason).toBe("turn_start");
+    expect(packet.sessionId).toBe("s-recall-only");
+    expect(pipeline.sessionManager.getSession("s-recall-only")).toBeNull();
+    expect(dbHandle!.repos.episodes.list({ sessionId: "s-recall-only" })).toEqual([]);
+  });
+
+  it("prepares relation and intent routing without running retrieval", async () => {
+    const embedder = fakeEmbedder({ dimensions: 384 });
+    pipeline = createPipeline(buildDeps(dbHandle!, embedder));
+    const requestsBefore = embedder.stats().requests;
+
+    const prepared = await pipeline.prepareTurn({
+      agent: "deepseek-harness",
+      sessionId: "s-prepare-only",
+      userText: "continue the repository migration",
+      ts: 1_700_000_000_000,
+    });
+
+    expect(prepared.sessionId).toBe("s-prepare-only");
+    expect(prepared.episodeId).toBeTruthy();
+    expect(pipeline.sessionManager.getSession("s-prepare-only")).not.toBeNull();
+    expect(dbHandle!.repos.episodes.list({ sessionId: "s-prepare-only" })).toHaveLength(1);
+    expect(embedder.stats().requests).toBe(requestsBefore);
+  });
+
   it("threads a dedicated l3Llm through to the handle", () => {
     const l3Llm = fakeLlm({ completeJson: {} });
     pipeline = createPipeline({ ...buildDeps(dbHandle!), l3Llm });
