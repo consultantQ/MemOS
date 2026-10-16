@@ -109,7 +109,7 @@ class H:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CE Hook declarations
+#  CE custom Hook declarations (@hookable-generated ones need not be declared here)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 define_hook(
@@ -237,7 +237,7 @@ define_hook(
 )
 
 # Operation-boundary Hooks. Their business data remains explicit in the
-# normal Hook keyword-argument contract; HookContext only carries correlation
+# normal keyword-argument contract. HookContext only carries correlation
 # metadata.
 define_hook(
     H.TEXT_MEMORY_ADD_AFTER,

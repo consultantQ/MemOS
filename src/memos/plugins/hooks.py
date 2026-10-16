@@ -46,7 +46,7 @@ def _invoke_hook_callback(callback: Callable, kwargs: dict[str, Any]) -> Any:
 
     ``hook_context`` is additive framework metadata. Older callbacks that use
     an exact keyword-only signature continue to receive the original business
-    arguments; context-aware callbacks and callbacks with ``**kwargs`` receive
+    arguments. Context-aware callbacks and callbacks with ``**kwargs`` receive
     the complete contract.
     """
     if "hook_context" not in kwargs or _accepts_hook_context(callback):

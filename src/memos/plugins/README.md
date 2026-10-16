@@ -286,23 +286,7 @@ Hook callbacks receive keyword arguments. Some Hooks define a `pipe_key`; when a
 callback returns a non-`None` value, that value replaces the named argument for
 later callbacks and for the caller.
 
-`hook_context` is additive correlation metadata, not a separate event model.
-Context-aware callbacks can declare it explicitly or accept `**kwargs`. Legacy
-callbacks with an exact signature remain compatible: the runtime omits only an
-unsupported `hook_context` argument and still invokes the callback once. New
-callbacks should accept `**kwargs` so later additive metadata remains backward
-compatible.
-
-All Search Hooks triggered for one request—from `SEARCH_BEFORE` through
-`SEARCH_AFTER`, including result and post-processing Hooks—receive the same
-`HookContext` instance and `operation_id`.
-
-The MemReader extraction, Textual Memory add, and successful Scheduler
-operation Hooks pipe their `result` value. Their matching failure Hooks are
-notifications and therefore do not define a `pipe_key`.
-
-`SEARCH_POST_PROCESS_FAILED` reports a result post-processing error that
-continues to propagate to the Search API caller.
+`hook_context` is additive correlation metadata. Context-aware callbacks can declare it explicitly or accept `**kwargs`. Legacy callbacks with an exact signature remain compatible: the runtime omits only an unsupported `hook_context` argument and still invokes the callback once. New callbacks should accept `**kwargs` so later additive metadata remains backward compatible.
 
 For example, `add.after` can replace `result`:
 
