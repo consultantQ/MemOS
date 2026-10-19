@@ -11,39 +11,13 @@ The runtime lives in [hooks.py](hooks.py).
 
 ## How hooks work
 
-Every hook falls into one of two patterns:
+Every hook falls into one of three patterns:
 
 | Pattern | Return value matters? | API | Exception handling |
 | --- | --- | --- | --- |
 | **Pipeline hook** — has a `pipe_key` | Yes — non-`None` replaces that argument for subsequent callbacks | `trigger_hook` | Logged and swallowed; later callbacks still run |
 | **Observer hook** — no `pipe_key` | No | `trigger_hook` | Logged and swallowed |
 | **Single-provider hook** | Returned directly to caller | `trigger_single_hook` | Re-raised |
-
-Memory-version and Dream business hooks use the single-provider API; their declarations
-are in [hook_defs.py](hook_defs.py). All hooks documented below use `trigger_hook`.
-
-### Quick example
-
-```python
-from memos.plugins import H
-
-class MyPlugin(BasePlugin):
-    def on_enable(self):
-        # Observe results without changing them
-        self.register_hook(H.SEARCH_AFTER, self._on_search_done)
-
-        # Replace results mid-pipeline
-        self.register_hook(H.SEARCH_RESULTS_AFTER_RERANK, self._rerank)
-
-    def _on_search_done(self, request, result, **kwargs):
-        print(f"Search for '{request.query}' returned {len(result.memories)} results")
-
-    def _rerank(self, results, **kwargs):
-        # pipe_key=results — return non-None to propagate the change
-        for bucket in results.values():
-            bucket.sort(key=lambda m: my_score(m), reverse=True)
-        return results
-```
 
 ---
 
@@ -68,25 +42,6 @@ The `pipe_key` column tells you which argument a return value replaces:
 Because arguments are live objects, in-place mutations are visible to later callbacks even when
 your callback returns `None`. Return a copy when isolation is needed, and preserve the shape
 downstream code expects.
-
----
-
-## Observer callbacks (no `pipe_key`)
-
-Return values are ignored. These hooks are for side effects only — logging, metrics,
-notifications, etc. The same live-object caveat applies: mutating an argument in-place
-is visible downstream even though the callback's return is discarded.
-
----
-
-## Exception handling
-
-`trigger_hook` logs any `Exception` raised by a callback and continues to subsequent
-callbacks. Mutations made before the exception are **not** rolled back. A crashing observer
-does not, by itself, fail the business operation.
-
-The single-provider API (`trigger_single_hook`) propagates exceptions — see each hook's
-documentation for which API it uses.
 
 ---
 
@@ -241,11 +196,11 @@ user, session, task, and cube metadata come from the add operation.
 ## Scheduler memory operations
 
 `MemReadMessageHandler` observes selected operations through `SchedulerOperationObserver`.
-Both hooks receive `hook_context`, `operation`, `target`, and `operation_input`.
+Both hooks receive `hook_context`, `operation`, and `operation_input`.
 
 ```text
 SchedulerOperationObserver
-  └─► operation (fine | add | archive | delete | soft_delete)
+  └─► operation (fine | add | delete | soft_delete)
       ├─► [success] scheduler.memory.operation.after
       └─► [failure] scheduler.memory.operation.failed
 ```
@@ -255,18 +210,14 @@ SchedulerOperationObserver
 | `H.SCHEDULER_MEMORY_OPERATION_AFTER` / `scheduler.memory.operation.after` | `result` | `result` |
 | `H.SCHEDULER_MEMORY_OPERATION_FAILED` / `scheduler.memory.operation.failed` | `error` | — |
 
-For the current MemRead integration, `target` is `textual_memory`. Context source has the
-prefix `scheduler.mem_read.` followed by the operation suffix below.
+Context source has the prefix `scheduler.mem_read.` followed by the operation suffix below.
 
 | `operation` | Source suffix | `operation_input` keys | Successful result | Notes |
 | --- | --- | --- | --- | --- |
-| `fine` | `fine_transfer_simple_mem` | `memories`, `type`, `result_grouping` | Nested reader output; replacements consumed before flattening and storage. | See [Fine-transfer result grouping](#fine-transfer-result-grouping). |
+| `fine` | `fine_transfer_simple_mem` | `memories`, `type`, `custom_tags`, `user_name`, `chat_history`, `user_context`, `is_upload_skill`, `result_grouping` | Nested reader output; replacements consumed before flattening and storage. | See [Fine-transfer result grouping](#fine-transfer-result-grouping). |
 | `add` | `add_enhanced_memories` | `memories`, `user_name` | Stored IDs; replacements consumed by subsequent processing. | |
-| `archive` | `archive_merged_memories` | `memory_ids` | Backend update return value; handler does not consume a replacement. | May emit one observation per merged memory. |
-| `delete` | `remove_memories` | `memory_ids` | Backend delete return value; handler does not consume a replacement. | |
-| `soft_delete` | `remove_memories` | `memory_ids`, `preserved_memory_ids` | Backend soft-delete return value; handler does not consume a replacement. | |
-
-Context attributes include available `scheduler_item_id`, `redis_message_id`, and `label`.
+| `delete` | `remove_memories` | `memory_ids`, `user_name` | Backend delete return value; handler does not consume a replacement. | |
+| `soft_delete` | `remove_memories` | `memory_ids`, `user_name`, `preserved_memory_ids` | Backend soft-delete return value; handler does not consume a replacement. | |
 
 The observer emits a success hook only after the operation block exits successfully — a
 recorded `None` is still a successful result. Failure is reported at most once per observer.

@@ -42,8 +42,7 @@ class BaseSchedulerHandler:
         operation_name: str,
         *,
         operation: str,
-        target: str,
-        operation_context: Any,
+        operation_context: dict[str, Any],
         operation_input: dict[str, Any],
         capture_failure: bool = False,
     ) -> SchedulerOperationObserver:
@@ -52,7 +51,6 @@ class BaseSchedulerHandler:
         return SchedulerOperationObserver(
             source=source,
             operation=operation,
-            target=target,
             operation_context=operation_context,
             operation_input=operation_input,
             capture_failure=capture_failure,

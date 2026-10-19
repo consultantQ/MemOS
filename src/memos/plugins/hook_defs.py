@@ -103,7 +103,7 @@ class H:
     SCHEDULER_MEMORY_OPERATION_AFTER = "scheduler.memory.operation.after"
     SCHEDULER_MEMORY_OPERATION_FAILED = "scheduler.memory.operation.failed"
 
-    # mem_reader — generic extension point before LLM extraction
+    # mem_reader — memory extraction
     MEM_READER_EXTRACT_AFTER = "mem_reader.extract.after"
     MEM_READER_EXTRACT_FAILED = "mem_reader.extract.failed"
 
@@ -255,14 +255,14 @@ define_hook(
 define_hook(
     H.SCHEDULER_MEMORY_OPERATION_AFTER,
     description="Observe or replace a successful Scheduler memory operation result",
-    params=["hook_context", "operation", "target", "operation_input", "result"],
+    params=["hook_context", "operation", "operation_input", "result"],
     pipe_key="result",
 )
 
 define_hook(
     H.SCHEDULER_MEMORY_OPERATION_FAILED,
     description="Observe a failed Scheduler memory operation and its error",
-    params=["hook_context", "operation", "target", "operation_input", "error"],
+    params=["hook_context", "operation", "operation_input", "error"],
 )
 
 define_hook(

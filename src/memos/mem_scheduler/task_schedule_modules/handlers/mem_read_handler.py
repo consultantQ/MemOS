@@ -96,7 +96,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                 info=info,
                 chat_history=chat_history,
                 user_context=user_context,
-                operation_context=message,
+                operation_context=message.model_dump(),
             )
 
             logger.info(
@@ -120,7 +120,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
         info: dict | None = None,
         chat_history: list | None = None,
         user_context: UserContext | None = None,
-        operation_context: Any | None = None,
+        operation_context: dict | None = None,
     ) -> None:
         logger.info(
             "[DIAGNOSTIC] mem_read_handler._process_memories_with_reader called. mem_ids: %s, user_id: %s, mem_cube_id: %s, task_id: %s",
@@ -180,11 +180,15 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                 with self.observe_operation(
                     "fine_transfer_simple_mem",
                     operation="fine",
-                    target="textual_memory",
                     operation_context=operation_context,
                     operation_input={
                         "memories": memory_items,
                         "type": "chat",
+                        "custom_tags": custom_tags,
+                        "user_name": user_name,
+                        "chat_history": chat_history,
+                        "user_context": user_context,
+                        "is_upload_skill": is_upload_skill,
                         "result_grouping": self._fine_transfer_result_grouping(mem_reader),
                     },
                     capture_failure=True,
@@ -221,7 +225,6 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                     with self.observe_operation(
                         "add_enhanced_memories",
                         operation="add",
-                        target="textual_memory",
                         operation_context=operation_context,
                         operation_input={"memories": mem_group, "user_name": user_name},
                         capture_failure=True,
@@ -276,21 +279,11 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                                     )
                                     for old_id in old_ids:
                                         try:
-                                            with self.observe_operation(
-                                                "archive_merged_memories",
-                                                operation="archive",
-                                                target="textual_memory",
-                                                operation_context=operation_context,
-                                                operation_input={"memory_ids": [str(old_id)]},
-                                                capture_failure=True,
-                                            ) as observation:
-                                                observation.result(
-                                                    mem_reader.graph_db.update_node(
-                                                        str(old_id),
-                                                        {"status": "archived"},
-                                                        user_name=user_name,
-                                                    )
-                                                )
+                                            mem_reader.graph_db.update_node(
+                                                str(old_id),
+                                                {"status": "archived"},
+                                                user_name=user_name,
+                                            )
                                             logger.info(
                                                 "[Scheduler] Archived merged_from memory: %s",
                                                 old_id,
@@ -450,9 +443,8 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                         with self.observe_operation(
                             "remove_memories",
                             operation="delete",
-                            target="textual_memory",
                             operation_context=operation_context,
-                            operation_input={"memory_ids": delete_ids},
+                            operation_input={"memory_ids": delete_ids, "user_name": user_name},
                             capture_failure=True,
                         ) as observation:
                             observation.result(text_mem.delete(delete_ids, user_name=user_name))
@@ -476,10 +468,10 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                         with self.observe_operation(
                             "remove_memories",
                             operation="soft_delete",
-                            target="textual_memory",
                             operation_context=operation_context,
                             operation_input={
                                 "memory_ids": delete_ids,
+                                "user_name": user_name,
                                 "preserved_memory_ids": preserved_memory_ids,
                             },
                             capture_failure=True,
