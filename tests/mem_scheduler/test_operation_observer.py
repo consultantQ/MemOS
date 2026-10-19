@@ -12,7 +12,8 @@ from memos.mem_scheduler.task_schedule_modules.operation_observer import (
     SchedulerOperationObserver,
 )
 from memos.memories.textual.item import TextualMemoryItem, TreeNodeTextualMemoryMetadata
-from memos.plugins.hook_defs import H
+from memos.memories.textual.tree import TreeTextMemory
+from memos.plugins.hook_defs import H, get_hook_spec
 from memos.plugins.hooks import register_hook
 
 
@@ -24,7 +25,6 @@ SCHEDULER_ITEM_ID = "00000000-0000-0000-0000-000000000003"
 OPERATION_SOURCE = {
     "fine": "fine_transfer_simple_mem",
     "add": "add_enhanced_memories",
-    "archive": "archive_merged_memories",
     "delete": "remove_memories",
     "soft_delete": "remove_memories",
 }
@@ -58,12 +58,14 @@ def _mem_read_dependencies(memory_version_switch):
     reader.memory_version_switch = memory_version_switch
 
     text_memory = MagicMock()
+    text_memory.__class__ = TreeTextMemory
     text_memory.get.return_value = raw_memory
     text_memory.add.return_value = [ENHANCED_MEMORY_ID]
     text_memory.memory_manager.reorganizer.is_reorganize = False
 
     scheduler_context = MagicMock()
     scheduler_context.get_mem_reader.return_value = reader
+    scheduler_context.get_mem_cube.return_value.text_mem = text_memory
     scheduler_context.services.create_event_log.return_value = MagicMock()
 
     message = ScheduleMessageItem(
@@ -104,7 +106,7 @@ def test_mem_read_handler_uses_replaced_transfer_results_and_stored_ids(monkeypa
         mem_cube_id="cube-1",
         text_mem=text_memory,
         user_name="cube-1",
-        operation_context=message,
+        operation_context=message.model_dump(),
     )
 
     text_memory.add.assert_called_once_with([replacement], user_name="cube-1")
@@ -124,7 +126,6 @@ def test_scheduler_observer_pipes_result_and_exposes_operation_contract():
     with SchedulerOperationObserver(
         source="scheduler.mem_read.add_enhanced_memories",
         operation="add",
-        target="textual_memory",
         operation_context={"trace_id": "trace-1", "task_id": "task-1"},
         operation_input={"memory_ids": ["memory-1"]},
     ) as observer:
@@ -132,7 +133,7 @@ def test_scheduler_observer_pipes_result_and_exposes_operation_contract():
 
     assert observer.value == ["plugin-result"]
     assert captured["operation"] == "add"
-    assert captured["target"] == "textual_memory"
+    assert set(captured) == set(get_hook_spec(H.SCHEDULER_MEMORY_OPERATION_AFTER).params)
     assert captured["operation_input"] == {"memory_ids": ["memory-1"]}
     assert captured["result"] == ["stored-1"]
     assert captured["hook_context"].source == "scheduler.mem_read.add_enhanced_memories"
@@ -152,7 +153,6 @@ def test_scheduler_observer_reports_failure_and_preserves_error():
     observer = SchedulerOperationObserver(
         source="scheduler.mem_read.fine_transfer_simple_mem",
         operation="fine",
-        target="textual_memory",
         operation_context={"trace_id": "trace-1", "mem_cube_id": "cube-1"},
         operation_input={"memory_ids": ["memory-1"]},
         capture_failure=True,
@@ -165,22 +165,29 @@ def test_scheduler_observer_reports_failure_and_preserves_error():
     assert [stage for stage, _kwargs in events] == ["failed"]
     failure = events[0][1]
     assert failure["error"] is error
+    assert set(failure) == set(get_hook_spec(H.SCHEDULER_MEMORY_OPERATION_FAILED).params)
     assert failure["hook_context"].cube_ids == ("cube-1",)
 
 
 @pytest.mark.parametrize(
     ("memory_version_switch", "expected_operations"),
     [
-        ("off", ["fine", "add", "archive", "delete"]),
+        ("off", ["fine", "add", "delete"]),
         ("on", ["fine", "add", "soft_delete"]),
     ],
 )
+@pytest.mark.parametrize("task_id", ["task-1", None])
 def test_mem_read_handler_exposes_each_memory_operation(
     memory_version_switch,
     expected_operations,
+    task_id,
     monkeypatch,
 ):
     handler, reader, text_memory, message = _mem_read_dependencies(memory_version_switch)
+    message.task_id = task_id
+    message.redis_message_id = "synthetic-redis-id"
+    message.info = {"custom_tags": ["synthetic-tag"], "is_upload_skill": True}
+    message.chat_history = [{"role": "user", "content": "synthetic history"}]
     events = []
     monkeypatch.setattr(
         "memos.mem_scheduler.task_schedule_modules.handlers.mem_read_handler.is_playground_api",
@@ -193,15 +200,7 @@ def test_mem_read_handler_exposes_each_memory_operation(
 
     register_hook(H.SCHEDULER_MEMORY_OPERATION_AFTER, record_operation)
 
-    handler._process_memories_with_reader(
-        mem_ids=[RAW_MEMORY_ID],
-        user_id="alice",
-        mem_cube_id="cube-1",
-        text_mem=text_memory,
-        user_name="cube-1",
-        task_id="task-1",
-        operation_context=message,
-    )
+    handler.process_message(message)
 
     assert [event["operation"] for event in events] == expected_operations
     assert [event["hook_context"].source for event in events] == [
@@ -209,24 +208,34 @@ def test_mem_read_handler_exposes_each_memory_operation(
     ]
     for event in events:
         context = event["hook_context"]
-        assert event["target"] == "textual_memory"
         assert context.trace_id == "trace-1"
         assert context.user_id == "alice"
         assert context.session_id == "session-1"
-        assert context.task_id == "task-1"
+        assert context.task_id == task_id
         assert context.cube_ids == ("cube-1",)
-        assert context.attributes["scheduler_item_id"] == SCHEDULER_ITEM_ID
-        assert context.attributes["label"] == "mem_read"
+        assert context.attributes == {"scheduler_item_id": SCHEDULER_ITEM_ID, "label": "mem_read"}
 
     inputs = {event["operation"]: event["operation_input"] for event in events}
     assert inputs["fine"]["memories"][0].id == RAW_MEMORY_ID
     assert inputs["fine"]["type"] == "chat"
+    fine_input = inputs["fine"]
+    reader.fine_transfer_simple_mem.assert_called_once_with(
+        fine_input["memories"],
+        type=fine_input["type"],
+        custom_tags=fine_input["custom_tags"],
+        user_name=fine_input["user_name"],
+        chat_history=fine_input["chat_history"],
+        user_context=fine_input["user_context"],
+        is_upload_skill=fine_input["is_upload_skill"],
+    )
+    assert fine_input["custom_tags"] == ["synthetic-tag"]
+    assert fine_input["chat_history"] == message.chat_history
+    assert fine_input["is_upload_skill"] is True
     assert inputs["add"]["memories"][0].id == ENHANCED_MEMORY_ID
     assert inputs["add"]["user_name"] == "cube-1"
 
     if memory_version_switch == "off":
-        assert inputs["archive"] == {"memory_ids": [RAW_MEMORY_ID]}
-        assert inputs["delete"] == {"memory_ids": [RAW_MEMORY_ID]}
+        assert inputs["delete"] == {"memory_ids": [RAW_MEMORY_ID], "user_name": "cube-1"}
         reader.graph_db.update_node.assert_called_once_with(
             RAW_MEMORY_ID,
             {"status": "archived"},
@@ -237,6 +246,7 @@ def test_mem_read_handler_exposes_each_memory_operation(
     else:
         assert inputs["soft_delete"] == {
             "memory_ids": [RAW_MEMORY_ID],
+            "user_name": "cube-1",
             "preserved_memory_ids": [ENHANCED_MEMORY_ID],
         }
         reader.graph_db.update_node.assert_not_called()

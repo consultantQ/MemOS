@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from contextlib import AbstractContextManager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from memos.plugins.hook_context import build_hook_context
 from memos.plugins.hook_defs import H
 from memos.plugins.hooks import trigger_hook
+
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 _MISSING = object()
@@ -26,24 +29,20 @@ class SchedulerOperationObserver(AbstractContextManager["SchedulerOperationObser
         *,
         source: str,
         operation: str,
-        target: str,
-        operation_context: Any,
+        operation_context: dict[str, Any],
         operation_input: Mapping[str, Any],
         capture_failure: bool = False,
     ) -> None:
         self._hook_kwargs = {
             "operation": operation,
-            "target": target,
             "operation_input": dict(operation_input),
         }
-        cube_id = self._context_value(operation_context, "cube_id") or self._context_value(
-            operation_context, "mem_cube_id"
-        )
+        cube_id = operation_context.get("cube_id") or operation_context.get("mem_cube_id")
         self._hook_context = build_hook_context(
-            trace_id=self._context_value(operation_context, "trace_id"),
-            user_id=self._context_value(operation_context, "user_id"),
-            session_id=self._context_value(operation_context, "session_id"),
-            task_id=self._context_value(operation_context, "task_id"),
+            trace_id=operation_context.get("trace_id"),
+            user_id=operation_context.get("user_id"),
+            session_id=operation_context.get("session_id"),
+            task_id=operation_context.get("task_id"),
             cube_ids=[str(cube_id)] if cube_id else None,
             source=source,
             attributes=self._attributes(operation_context),
@@ -95,17 +94,10 @@ class SchedulerOperationObserver(AbstractContextManager["SchedulerOperationObser
         )
 
     @staticmethod
-    def _context_value(operation_context: Any, name: str) -> Any:
-        if isinstance(operation_context, Mapping):
-            return operation_context.get(name)
-        return getattr(operation_context, name, None)
-
-    @classmethod
-    def _attributes(cls, operation_context: Any) -> dict[str, Any]:
+    def _attributes(operation_context: dict[str, Any]) -> dict[str, Any]:
         attributes = {
-            "scheduler_item_id": cls._context_value(operation_context, "scheduler_item_id")
-            or cls._context_value(operation_context, "item_id"),
-            "redis_message_id": cls._context_value(operation_context, "redis_message_id"),
-            "label": cls._context_value(operation_context, "label"),
+            "scheduler_item_id": operation_context.get("scheduler_item_id")
+            or operation_context.get("item_id"),
+            "label": operation_context.get("label"),
         }
         return {key: value for key, value in attributes.items() if value is not None}

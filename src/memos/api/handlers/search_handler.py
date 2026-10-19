@@ -98,8 +98,6 @@ class SearchHandler(BaseHandler):
 
         # Use deepcopy to avoid modifying the original request object
         search_req_local = copy.deepcopy(search_req)
-        if hook_context is None:
-            hook_context = self._build_search_hook_context(search_req_local)
 
         # Expand top_k for deduplication (5x to ensure enough candidates)
         if search_req_local.dedup in ("sim", "mmr"):
@@ -108,7 +106,6 @@ class SearchHandler(BaseHandler):
         # Search and deduplicate
         cube_view = self._build_cube_view(search_req_local)
         results = cube_view.search_memories(search_req_local)
-
         hooked_results = trigger_hook(
             H.SEARCH_MEMORY_RESULTS,
             hook_context=hook_context,
