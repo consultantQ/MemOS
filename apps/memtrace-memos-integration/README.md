@@ -132,7 +132,7 @@ Set these environment variables before loading the plugin. Restart MemOS after c
 | `MEMOS_SMARTCOMMENT_MAX_CACHED_TRACES` | `64` | Maximum graphs retained in memory. |
 | `MEMOS_SMARTCOMMENT_MAX_CACHED_GRAPH_ITEMS` | `50000` | Maximum cached nodes, edges, operations, and sessions. |
 | `MEMOS_SMARTCOMMENT_CACHE_TTL_SECONDS` | `300` | Idle cache expiration in seconds. |
-| `MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD` | `false` | Include the Add ancestry of final Search hits and link persisted memory nodes to the final result lists. |
+| `MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD` | `false` | Include the Add ancestry of final Search hits and link final result lists to persisted memory nodes. |
 
 Snapshots are written atomically. An idle or full in-memory cache can be evicted; a later event restores the saved graph and appends to it. Cache limits do not delete JSON files. Use a different output directory for each writer process, including when running multiple server workers.
 
@@ -152,13 +152,16 @@ message batch -> extracted memory -> persisted memory -> enhanced memory
                                                             |
                                                             v
                                                     persisted memory
+                                                            ^
+                                             memory_search_lineage (rank, score)
                                                             |
-                                                   memory_search_lineage
-                                                            v
                                                  final search memory list
 ```
 
-The new edge points **from the persisted memory to the final Search list**. Only
+The new edge points **from the final Search list to the persisted memory**. Its comment
+shows `rank` (1-based position within that final list) and the observed `score`, for
+example `rank=2, score=0.8`. Both fields are also stored in edge metadata. Zero scores
+are preserved; missing scores are shown as `unknown` and stored as `null`. Only
 explicit incoming dependencies are followed; sibling outputs from the same Add,
 unrelated memories, downstream archive/delete branches, and prior Search graphs
 are not imported. A shared ancestor is included once. If multiple source memories
@@ -166,8 +169,9 @@ actually contributed to a merged memory, all those ancestors remain relevant.
 Message batches remain the original captured units; the plugin does not infer
 which individual messages within a batch contributed to a memory.
 
-Raw candidates and filtered lists do not trigger Add imports. Repeated hits in one
-list share a single link; the same memory in different final lists links to each.
+Only final results trigger Add imports. Repeated hits in one list share a single link
+using their first occurrence's rank and score; each final list links to the same memory
+independently. Unresolved or anonymous entries still occupy their original list positions.
 Missing IDs, unavailable Add history, and ambiguous identities produce no guessed
 links. `memos.search.link_add_lineage` reports linked/unresolved counts for distinct
 identifiable hits per list. Imported items retain `lineage_source_trace_id` metadata;
@@ -232,15 +236,14 @@ The asynchronous MemRead scheduler also emits:
 
 - `enhanced_memory`: a fine-transfer result reused as the input to the enhanced-memory
   database write;
-- `scheduler_result`: a string result for operations such as archive, delete,
+- `scheduler_result`: a string result for operations such as delete, soft-delete,
   or failure that do not otherwise expose a graphable output value.
 
 Scheduler fine-transfer inputs reuse the `memory:<cube_id>:<memory_id>` identity created
 by the earlier TextMemory persistence event. This connects the original persisted memory
-to its enhanced successor without creating a duplicate memory node. Archive, delete,
+to its enhanced successor without creating a duplicate memory node. Delete,
 soft-delete, and failed MemRead operations are also recorded; failures include only the
-error type, not the error message or an error-value node. The current MemRead refresh
-call is not wrapped by an operation Hook and is not recorded separately.
+error type, not the error message or an error-value node.
 
 A persisted memory unit is one immutable graph anchor per cube and memory ID. Its first
 complete snapshot is retained; different later observations log a warning without replacing
@@ -268,6 +271,18 @@ Successful MemReader, TextMemory, and scheduler callbacks observe the piped `res
 their matching `failed` callbacks record a status node without changing MemOS exception
 handling. MemReader and TextMemory failures also omit exception messages.
 
+Scheduler callbacks receive `hook_context`, `operation`, `operation_input`, and either
+`result` or `error`. Scheduler message dictionaries are converted into `HookContext` by MemOS; the
+plugin uses that context for trace, user, session, task, and cube correlation.
+
+Fine-transfer `operation_input` includes `memories`, `type`, `custom_tags`, `user_name`,
+`chat_history`, `user_context`, `is_upload_skill`, and `result_grouping`. Delete and
+soft-delete inputs include `memory_ids` and `user_name`; soft-delete also includes
+`preserved_memory_ids`. The plugin uses `user_name` only as a fallback cube identifier,
+never as the user identity. Reader arguments do not become memory nodes, and preserved
+IDs do not become deletion edges. See the [MemOS Hook reference](../../src/memos/plugins/HOOKS.md#scheduler-memory-operations)
+for the upstream contract.
+
 A successful Hook means the observed method returned; the plugin does not independently
 verify database persistence. MemOS may catch and log lower-level write errors before
 they reach the Hook boundary, so a `persisted_memory` node alone is not proof of a
@@ -280,10 +295,6 @@ pipeline for each populated type/cube bucket:
 
 ```text
 query -> memory type -> cube -> raw list -> threshold list -> dedup list -> rerank list
-                                  |              |              |
-                                  v              v              v
-                            threshold's      dedup's        rerank's
-                            filtered list    filtered list  filtered list
 ```
 
 Raw retrieval creates `search_memory_type` and `search_cube` branch nodes followed
@@ -292,6 +303,9 @@ omitted. The three retrieval links use `memory_type_branch`, `memory_cube_branch
 and `memory_retrieval`, respectively. Every enabled, observed stage creates one new
 list node per observed bucket and connects the last recorded list directly to it.
 A fully removed bucket continues as an empty list, preserving the stage chain.
+The list categories are `search_memory_list_raw`, `search_memory_list_threshold`,
+`search_memory_list_dedup`, and `search_memory_list_rerank`, so DOT colors each stage
+separately. Their `class_name` remains `search_memory_list`.
 
 The plugin follows the API's current stage conditions even though the API emits
 Hooks for disabled stages: threshold is recorded only when `relativity > 0`, and
@@ -312,26 +326,26 @@ the list node's metadata. Individual memories no longer create graph nodes, rank
 or pairwise node matches. Snapshots are taken per entry so the outer list retains
 all results, including lists longer than 200 entries; field truncation and redaction
 still apply within each entry. With `MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD=true`,
-final lists additionally receive incoming links from matching persisted memory units.
+final lists additionally link to matching persisted memory units, with per-list rank
+and score on each edge.
 
-When a stage removes entries, its last recorded list also connects to a
-`search_filter_result` node containing the removed entries, rather than a status
-string. One filtered list is created per affected bucket. Differences preserve
-duplicate counts and prefer identical entries before falling back to memory ID
-(or original text for anonymous entries), so reordered results and expanded text
-with the same ID are not treated as removals. `filtered_count` counts removed
-memories across buckets. No filtered node is created when nothing was removed.
+Each stage records only its retained result lists. Removed entries do not create
+separate list nodes or edges. `filtered_count` still counts removed occurrences across
+buckets by memory ID (or original text for anonymous entries), including duplicates.
+Reordering, expanded text, and score changes for the same ID do not count as removals.
 
-Branches and lists use `HookContext.operation_id` as their search scope. List links
+Branches and lists use `trace_id` for stage connections. List links
 use result type, cube ID, and the occurrence of that cube within the type; buckets
 without IDs use their position. Reordered unique cube IDs remain correctly linked.
 Repeated or missing cube IDs rely on stable occurrence order or position. A new
 bucket without a previous-stage list is retained without a guessed source edge.
 
-Search observation ends at `search.results.after_rerank`. Each search caches only
-its latest recorded lists; skipped stages leave that cache intact. Rerank,
-post-processing failure, and shutdown release
-remaining caches in their respective scopes. The current rerank event describes
+The plugin copies `HookContext.operation_id` unchanged into event, operation, and
+edge metadata. Optional Add-history links retain the rerank Hook's operation ID.
+
+Search observation ends at `search.results.after_rerank`. Each trace caches only
+its latest recorded lists; skipped stages leave that cache intact. Rerank and
+post-processing failure clear that trace's cache; shutdown clears all caches. The current rerank event describes
 the API's descending `metadata.relativity` sort; the tracing handler preserves
 observed order and does not sort results itself.
 

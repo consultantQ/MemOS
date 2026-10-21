@@ -39,12 +39,12 @@ Recorder 用 `id_strategy` 返回 `TraceValue.identity`，因此映射如下：
 | 标识 | 规则 |
 | --- | --- |
 | 图的隔离键 | Adapter 按 `(user_id, trace_id)` 管理图；`graph_id = trace_id`，`project_id` 来自配置，默认 `memos` |
-| `operation_id` | 来自 Hook 业务上下文，用于关联一次业务操作；存在时由 `_event()` 补入 `TraceEvent.metadata` |
-| `event_id` | 每次创建事件都生成一个 `uuid4().hex`，标识本次观测；不是业务 `operation_id` |
+| `operation_id` | 由 `_event()` 从 HookContext 原样复制到事件 metadata，再由 recorder 传入 operation 和 edge metadata |
+| `event_id` | 每次创建事件都生成一个 `uuid4().hex`，标识本次观测；与 `operation_id` 分别生成 |
 | `created_at` | 事件创建时的 UTC ISO 时间 |
 | SmartComment `session_id` | 每个事件使用 `event-{event_id}`，session 名称是 `event.operation` |
 | MemOS `session_id` | 业务会话 ID，导出时放在 session/operation metadata 的 `memos_session_id` 中 |
-| SmartComment `op_id` | 由 SmartComment 创建 operation 时分配；业务 `operation_id` 仍在 metadata 中 |
+| SmartComment `op_id` | 由 SmartComment 创建 operation 时分配；事件的 `operation_id` 保存在 metadata 中 |
 
 默认情况下，即使两个 trace 出现相同 `identity`，也不会跨图合并。开启 `MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD` 后，writer 会按最终 Search 命中的持久化记忆导入其 Add 上游子图，见第 4.1 节；不是全局合并 trace。
 
@@ -79,7 +79,7 @@ cube 列表取第一个非空字段：`writable_cube_ids → readable_cube_ids �
 | 节点 `category` | 值在流程中的业务角色，使用 snake_case 名词，如 `extracted_memory`、`persisted_memory`。相同正文在不同阶段可有不同角色。 |
 | 节点 `class_name` | SmartComment 类型/身份命名空间，不是阶段名；`memory` 共用于提取、增强和持久化记忆，`str` 用于查询和状态。改名会改变 `full_node_id`。 |
 | `TraceEvent.operation` | 稳定的操作标识，以 `memos.` 开头，点号分隔流程和动作；Scheduler 保留调用点及 `after/failed` 后缀。与业务关联 ID `operation_id` 不同。 |
-| 事件/边 `category` | 操作或依赖关系的类别，如 `memory_persistence`、`memory_filtered`，不要求与节点类别相同。 |
+| 事件/边 `category` | 操作或依赖关系的类别，如 `memory_persistence`、`memory_threshold_passed`，不要求与节点类别相同。 |
 | 节点 `comment` | 说明捕获了什么值及其观测边界；搜索列表注明阶段并保留返回顺序，状态节点不冒充业务输出。 |
 | 事件 `comment` | 说明本次操作的业务意图和实际观测结果，写入导出 operation/session 的 `comment`。自定义事件未提供时保留按 operation 生成的默认说明。 |
 | 连线 `comment` | 解释为什么从来源值连向目标值；所有内置流程显式提供，不用操作名代替依赖含义。 |
@@ -90,7 +90,7 @@ cube 列表取第一个非空字段：`writable_cube_ids → readable_cube_ids �
 
 ## 2. `TraceValue` 节点总表
 
-下面的 `{cube}` 在 Add 链中表示 `cube_id or 'unknown'`；`{trace}` 为解析后的 trace。`{search_scope}` 优先使用非 `None` 的 `operation_id`，否则使用 trace。`{status}` 在调度链中为 `after` 或 `failed`。
+下面的 `{cube}` 在 Add 链中表示 `cube_id or 'unknown'`；`{trace}` 为解析后的 trace，也是 Search 各阶段的关联依据。`{status}` 在调度链中为 `after` 或 `failed`。
 
 ### 2.1 AddHandler：输入、提取、持久化与后台增强
 
@@ -125,15 +125,14 @@ Recorder 对导出的 `persisted_memory.metadata` 额外添加 `snapshot_status=
 
 | 业务含义 | `category` | `class_name` | `identity` | `value` |
 | --- | --- | --- | --- | --- |
-| 搜索查询 | `search_query` | `str` | `search_query:{search_scope}` | 请求 query；无字段时默认空字符串 |
-| 召回类型分支 | `search_memory_type` | `search_memory_type` | `search_memory_type:{search_scope}:{result_type}` | results 顶层类型字符串，例如 `text_mem`、`tool_mem` |
-| 召回 cube 分支 | `search_cube` | `search_cube` | `search_cube:{search_scope}:{result_type}:{bucket_index}` | cube ID；缺失时为 `bucket-{bucket_index}` |
-| 阶段结果列表 | `search_memory_list` | `search_memory_list` | `search_memory_list:{search_scope}:{stage}:{bucket_key}` | 当前桶的记忆列表，每项包含 `memory_id`、`memory`、`score` |
-| 被过滤记忆列表 | `search_filter_result` | `search_memory_list` | `search_filter_result:{search_scope}:{stage}:{bucket_key}` | 当前阶段从前一阶段移除的记忆列表，条目形状与结果列表一致 |
+| 搜索查询 | `search_query` | `str` | `search_query:{trace}` | 请求 query；无字段时默认空字符串 |
+| 召回类型分支 | `search_memory_type` | `search_memory_type` | `search_memory_type:{trace}:{result_type}` | results 顶层类型字符串，例如 `text_mem`、`tool_mem` |
+| 召回 cube 分支 | `search_cube` | `search_cube` | `search_cube:{trace}:{result_type}:{bucket_index}` | cube ID；缺失时为 `bucket-{bucket_index}` |
+| 阶段结果列表 | `search_memory_list_{stage}` | `search_memory_list` | `search_memory_list:{trace}:{stage}:{bucket_key}` | 当前桶的记忆列表，每项包含 `memory_id`、`memory`、`score` |
 
 | 搜索身份/位置字段 | 规则 |
 | --- | --- |
-| `stage` | `raw`、`threshold`、`dedup`、`rerank` |
+| `stage` | `raw`、`threshold`、`dedup`、`rerank`；对应 category 为 `search_memory_list_raw`、`search_memory_list_threshold`、`search_memory_list_dedup`、`search_memory_list_rerank`，使 DOT 按阶段区分颜色 |
 | `result_type` | results 顶层 key 转字符串，例如 `text_mem`、`tool_mem`；handler 没有限定枚举，也不是源记忆的 `memory_type` |
 | `bucket_index` | 同一 result type 内的桶序号，从 0 开始 |
 | `bucket_key` | 紧凑 JSON 数组 `[result_type, cube_id, occurrence]` 经 URL 百分号编码后的字符串（`quote(..., safe="")`），避免引号和反斜杠破坏 DOT 节点 ID；cube ID 非 `None` 时 occurrence 为同 type 下该 cube 的出现序号，从 0 开始；缺失 ID 时使用 bucket_index |
@@ -147,8 +146,7 @@ Recorder 对导出的 `persisted_memory.metadata` 额外添加 `snapshot_status=
 | `search_query` | `memos_stage="search.before"` |
 | `search_memory_type` | `stage="raw"`、`result_type` |
 | `search_cube` | `stage="raw"`、`result_type`、`cube_id`、`bucket_index` |
-| `search_memory_list` | `stage`、`result_type`、`cube_id`、`bucket_index`、`memory_count` |
-| `search_filter_result` | 与结果列表相同，另加 `status="filtered"` |
+| `search_memory_list_{stage}` | `stage`、`result_type`、`cube_id`、`bucket_index`、`memory_count` |
 
 Search 消费的形状是 `result_type → 桶列表 → memories 列表`，例如：
 
@@ -169,11 +167,11 @@ results = {
 
 raw 阶段显式建立 `search_query → search_memory_type → search_cube → search_memory_list`。每个非空桶只创建一个记忆列表节点；空 type 和 cube 桶不产生分支。后续仅为已启用且收到 Hook 的阶段创建列表节点，连接最近实际记录的列表。关闭的阶段不产生事件、节点或边；已启用阶段即使结果没有改变也保留。若桶被全部过滤或从返回结构中消失，后续结果列表为 `[]`，链路继续保留。首次在后续阶段出现的非空桶保留独立列表，不猜测来源边。
 
-列表按 Hook 实际返回顺序保存；handler 不生成逐条 memory 节点，不计算 rank、rank_scope 或 global_position，也不做节点级配对。开启 Add 关联时，writer 额外导入命中记忆的 `persisted_memory` 及祖先，并连接到最终列表，见第 4.1 节。
+列表按 Hook 实际返回顺序保存；handler 不生成逐条 memory 节点，不计算 rank、rank_scope 或 global_position，也不做节点级配对。开启 Add 关联时，writer 额外导入命中记忆的 `persisted_memory` 及祖先，从最终列表连向记忆单元，并在边上记录列表内 rank 和 score，见第 4.1 节。
 
-被过滤的内容只通过相邻列表的多重集差集计算，不用于决定阶段连线。先扣除完全相同的条目，再按 memory ID 扣除剩余项；没有 ID 时使用原始正文。这样既保留重复项的数量，又不会将同 ID 的正文扩展或分数变化误报为过滤。无法区分的同 ID 剩余项按原列表次序扣除。过滤列表保留前一阶段的内容和顺序，仅在实际有移除项时生成。
+被过滤的记忆不生成独立列表节点或边。`filtered_count` 通过相邻已记录列表的多重集差集计数，按 memory ID 匹配；没有 ID 时使用截断前的原始正文。这样既保留重复项的数量，又不会将同 ID 的正文扩展或分数变化误报为过滤。该计数不用于决定阶段连线。
 
-内部保留脱离业务对象的完整条目用于差集计算，显示时逐条调用快照处理；外层结果/过滤列表不受通用 200 项容器截断限制，条目内部仍遵守文本长度、脱敏及向量省略规则。`memory_count` 为该列表实际条目数。
+内部保留脱离业务对象的完整条目用于差集计算，显示时逐条调用快照处理；外层结果列表不受通用 200 项容器截断限制，条目内部仍遵守文本长度、脱敏及向量省略规则。`memory_count` 为该列表实际条目数。
 
 ### 2.3 BaseHandler：通用失败状态
 
@@ -187,7 +185,7 @@ raw 阶段显式建立 `search_query → search_memory_type → search_cube → 
 
 MemRead 调度失败使用上一节的 `scheduler_result`，不使用这个节点。异常类型 `error_type` 放在事件/操作 metadata 中；异常对象和异常消息不作为失败节点内容。
 
-当前 handler 共使用 **6 种 class_name**：`message_batch`、`memory`、`str`、`search_memory_type`、`search_cube`、`search_memory_list`；共使用 **11 种节点 category**：以上表格中的五种 Add、五种 Search 和一种通用失败状态。`TraceValue` 自身的默认 `category="variable"`、`class_name=None` 供自定义调用使用，当前 handler 显式指定这两个字段。
+当前 handler 共使用 **6 种 class_name**：`message_batch`、`memory`、`str`、`search_memory_type`、`search_cube`、`search_memory_list`；共使用 **13 种节点 category**：以上表格中的五种 Add、七种 Search 和一种通用失败状态。`TraceValue` 自身的默认 `category="variable"`、`class_name=None` 供自定义调用使用，当前 handler 显式指定这两个字段。
 
 ## 3. AddHandler 的 operation 与连线
 
@@ -246,7 +244,7 @@ flowchart LR
 flowchart LR
     P[persisted_memory] -->|memory_refinement| E[enhanced_memory]
     E -->|memory_persistence| P2[persisted_memory]
-    P -->|归档、删除或其他操作结果| S[scheduler_result]
+    P -->|删除或其他操作结果| S[scheduler_result]
     E -->|scheduler_operation_failed| SF[scheduler_result: failed]
 ```
 
@@ -257,20 +255,23 @@ flowchart LR
 | 订阅 Hook | `scheduler.memory.operation.after` / `scheduler.memory.operation.failed` |
 | `event.operation` | `memos.scheduler.mem_read.{operation_name}.{status}` |
 | `event.category` | 固定 `scheduler_memory_operation` |
-| 共同 metadata | `memos_stage="scheduler.mem_read.{operation_name}.{status}"`、`handler="mem_read"`、`operation_name`、`operation`、`target`、`status` |
-| `operation / target` | 直接记录 Hook 参数，例如 `fine/add/archive/delete/soft_delete` 和 `textual_memory`；不是插件内强制枚举 |
+| 共同 metadata | `memos_stage="scheduler.mem_read.{operation_name}.{status}"`、`handler="mem_read"`、`operation_name`、`operation`、`status` |
+| `operation` | 直接记录 Hook 参数，当前 MemRead 使用 `fine/add/delete/soft_delete`；不是插件内强制枚举 |
 | 失败额外 metadata | `error_type`，仅异常类名 |
 
 | `operation_name` / 情况 | 输入、输出与边 category |
 | --- | --- |
 | `fine_transfer_simple_mem` 成功且有记忆输出 | operation_input.memories 中的持久化记忆引用 → enhanced_memory；`memory_refinement` |
 | `add_enhanced_memories` 成功且有返回 ID | enhanced_memory → persisted_memory；`memory_persistence`，沿用唯一 ID 配对 |
-| `archive_merged_memories` 成功 | memory_ids 对应持久化记忆 → scheduler_result；`memory_archival` |
-| `remove_memories` / `remove_source_memories` 成功 | memory_ids 对应持久化记忆 → scheduler_result；`memory_deletion` |
+| `remove_memories` 成功 | memory_ids 对应持久化记忆 → scheduler_result；`memory_deletion` |
 | 其他符合 source 前缀的操作成功 | memory_ids 对应持久化记忆 → scheduler_result；`scheduler_operation_result` |
 | 失败 | 当前操作输入 → scheduler_result；`scheduler_operation_failed`；增强写入失败保留 enhanced_memory 输入 |
 
-handler 并没有封闭的 operation_name 枚举：上述特殊分支之外，其他符合 source 前缀的名称按通用结果分支处理。这里描述的是插件收到 Hook 后的处理能力，不代表每个调度调用都有 Hook；当前 MemRead 的 `remove_and_refresh_memory` 没有独立观测点，不生成刷新事件。成功的 fine-transfer/增强写入如果没有记忆输出，也会生成 scheduler_result；没有输入时保留独立结果节点和 operation，不补造边。
+handler 并没有封闭的 operation_name 枚举：上述特殊分支之外，其他符合 source 前缀的名称按通用结果分支处理。这里描述的是插件收到 Hook 后的处理能力，不代表每个调度调用都有 Hook；当前 MemRead 的 `remove_and_refresh_memory` 和 merged-memory 归档调用没有独立观测点，不生成刷新或归档事件。成功的 fine-transfer/增强写入如果没有记忆输出，也会生成 scheduler_result；没有输入时保留独立结果节点和 operation，不补造边。
+
+当前回调参数为 `hook_context`、`operation`、`operation_input` 和成功时的 `result` / 失败时的 `error`。MemOS 将字典形式的调度消息转换为 `HookContext`，插件只从该 context 获取 trace、user、session、task 和 cube 关联信息；`operation_input.user_name` 仅作为 cube 缺失时的补充，不作为 user 身份。
+
+fine-transfer 输入现包含 `memories`、`type`、`custom_tags`、`user_name`、`chat_history`、`user_context`、`is_upload_skill`、`result_grouping`。删除输入包含 `memory_ids`、`user_name`，软删除额外包含 `preserved_memory_ids`。插件只用记忆输入及 grouping 构造来源边，不将其他 reader 参数绘成记忆节点，也不为 preserved IDs 生成删除边。上游契约见 [HOOKS.md](../../../src/memos/plugins/HOOKS.md#scheduler-memory-operations)。
 
 fine-transfer 额外记录 `result_grouping`，取自 `operation_input`，缺省 `unknown`：
 
@@ -295,12 +296,9 @@ flowchart LR
     R -->|memory_threshold_passed| T[threshold]
     T -->|memory_deduplicated| D[dedup]
     D -->|memory_reranked| RR[rerank]
-    R -->|memory_filtered| F1[threshold: filtered list]
-    T -->|memory_filtered| F2[dedup: filtered list]
-    D -->|memory_filtered| F3[rerank: filtered list]
 ```
 
-上图展示全部阶段启用时的链路。raw、threshold、dedup、rerank 框都表示一个桶的 `search_memory_list` 节点；filtered list 表示该桶在当前阶段移除的记忆列表。
+上图展示全部阶段启用时的链路。raw、threshold、dedup、rerank 框都表示一个桶在该阶段保留的 `search_memory_list` 节点。
 
 插件按当前业务条件判断阶段是否启用：`relativity > 0` 才记录 threshold，`dedup` 为 `sim` 或 `mmr` 才记录 dedup。业务层即使跳过处理仍会发出这两个 Hook，插件会直接忽略它们，并保留最近记录的列表。只关闭 threshold 时链路为 `raw → dedup → rerank`；只关闭 dedup 时为 `raw → threshold → rerank`；两者都关闭时为 `raw → rerank`。中间 Hook 未触发时，后续阶段同样连接最近实际记录的列表。
 
@@ -315,7 +313,7 @@ API 后处理当前始终调用 `rerank_knowledge_mem`，因此收到 rerank Hoo
 | `search.results.after_rerank` | `memos.search.rerank` | `memory_reranking` | 最近记录列表 → rerank；`memory_reranked` |
 | `search.post_process.failed` | `memos.search.post_process.failed` | `search_failure` | query → operation_status；`operation_failed` |
 
-已记录的 threshold、dedup、rerank 中，每个桶最近实际记录的结果列表连接当前结果列表；若有条目移除，再以一条 `memory_filtered` 边连接该桶的 `search_filter_result` 列表。差集和来源边均以最近记录的列表为准，因此跳过阶段不会丢失过滤内容。被过滤列表也包括去重及 rerank 阶段移除的记忆，且不再使用固定字符串状态节点。
+已记录的 threshold、dedup、rerank 中，每个桶最近实际记录的结果列表连接当前保留的结果列表；不为阈值过滤、去重或 rerank 移除的条目生成独立列表或状态节点。过滤数量统计和来源边均以最近实际记录的列表为准。
 
 | 操作 | 由 handler 添加的 `TraceEvent.metadata`，不含公共补充字段 |
 | --- | --- |
@@ -326,24 +324,26 @@ API 后处理当前始终调用 `rerank_knowledge_mem`，因此收到 rerank Hoo
 | rerank | `memos_stage="search.results.after_rerank"`、`algorithm="relativity_sort"`、`order_by="metadata.relativity"`、`direction="descending"`、`top_k` |
 | post_process.failed | `memos_stage="search.post_process.failed"`、`status="failed"`、`error_type`、`handler`（API handler 的类名） |
 
-四个结果阶段另加 `link_strategy="bucket_lists"` 和 `filtered_count`。raw 阶段 filtered_count 为 0；其余阶段为所有桶的过滤列表条目数之和，不是过滤节点数。rerank 的 algorithm/order_by/direction 是插件当前固定写入的描述，不是对实际后端算法的动态识别；插件也不自己重新过滤、去重或排序。`top_k` 是当前 Hook 请求中的值，可能已经被业务层扩充。
+四个结果阶段另加 `link_strategy="bucket_lists"` 和 `filtered_count`。raw 阶段 filtered_count 为 0；其余阶段为相对最近记录阶段、所有桶移除的条目数之和。rerank 的 algorithm/order_by/direction 是插件当前固定写入的描述，不是对实际后端算法的动态识别；插件也不自己重新过滤、去重或排序。`top_k` 是当前 Hook 请求中的值，可能已经被业务层扩充。
 
-缓存键为 `(trace_id, search_scope_id)`，每次搜索只保存最近实际记录阶段的列表快照，按 bucket_key 索引。已记录阶段替换前一份快照；关闭的阶段不触碰缓存，raw 开始时丢弃同 scope 的旧快照；rerank 和 post_process.failed 清理本次搜索的缓存，shutdown 清理全部。若缺少 `operation_id`，search_scope 退回 trace，此时同 trace 多次搜索不再具有独立身份，调用方应提供一次搜索各 Hook 共享的 operation_id。
+缓存以 trace_id 为键，只保存该 trace 最近实际记录阶段的列表快照，按 bucket_key 索引。已记录阶段替换前一份快照；关闭的阶段不触碰缓存，raw 开始时丢弃该 trace 的旧快照；rerank 和 post_process.failed 清理该 trace 的缓存，shutdown 清理全部。
+
+各阶段事件使用对应 HookContext.operation_id，同一事件中的所有桶和连线共用该 ID。节点身份和缓存使用 trace_id；插件只消费 Hook 已提供的上下文。
 
 观测终点为 `search.results.after_rerank`；插件没有订阅 `search.context.render` 或 `search.after`。
 
-### 4.1 可选的 Add → Search 记忆流转
+### 4.1 可选的 Search → Add 记忆溯源
 
 `MEMOS_SMARTCOMMENT_LINK_SEARCH_TO_ADD` 默认 `false`，在插件加载时读取。
 开启后，异步 writer 只在 `memos.search.rerank` 事件落盘前进行关联：
 
-1. 从本次事件的最终 `search_memory_list` 读取 `(cube_id, memory_id)`，不读取 raw 或 filtered list 作为命中集合。
+1. 从本次事件的 `search_memory_list_rerank` 节点读取 `(cube_id, memory_id)`，不读取早期阶段结果作为命中集合。
 2. 在相同 user/project 的已落盘图中匹配持久化锚点。没有 ID、没有 Add 观测、身份有歧义时不猜测、不按正文匹配。
 3. 仅逆向遍历 `memory_extraction`、`memory_persistence`、`memory_refinement` 入边。共同祖先去重，可跨 trace 追溯 MemRead 增强的原始来源；不扩展兄弟输出、归档/删除分支或其他 Search。
 4. 导入选中的节点、边及其所需 operation/session，保留原 ID，graph_id 改为当前 Search trace，metadata 中以 `lineage_source_trace_id` 保存原 trace。源文件不变；已导入的副本不会成为后续 Search 的新来源。
-5. 用显式 `TraceLink` 创建 `persisted_memory → 最终 search_memory_list`，operation 为 `memos.search.link_add_lineage`，边 category 为 `memory_search_lineage`。一份列表中同一 memory 只连一次，不同列表各自连线。
+5. 用显式 `TraceLink` 创建 `最终 search_memory_list → persisted_memory`，operation 为 `memos.search.link_add_lineage`，边 category 为 `memory_search_lineage`。comment 展示该结果的 `rank` 和 `score`，例如 `rank=2, score=0.8`。rank 从 1 开始，以所属最终列表的实际返回顺序为准，不是跨桶的全局排名；未关联或无 ID 的条目仍占据原位置。一份列表中同一 memory 只连一次，使用第一次出现的 rank 和 score；不同列表各自连线。
 
-关联事件 metadata 中的 `requested_count`、`linked_count`、`unresolved_count` 按每个最终列表内去重后的、具有 cube/memory ID 的条目计数，`lineage_status` 为 `resolved/partial/unresolved`。边额外记录 `cube_id`、`memory_id`、`source_trace_id`。
+关联事件沿用 rerank Hook 的 `operation_id`。metadata 中的 `requested_count`、`linked_count`、`unresolved_count` 按每个最终列表内去重后的、具有 cube/memory ID 的条目计数，`lineage_status` 为 `resolved/partial/unresolved`。边额外记录 `cube_id`、`memory_id`、`source_trace_id`、`rank`、`score`。score 取结果条目中的实际分数，保留 0；缺失时 comment 显示 `score=unknown`，metadata 保存 `null`。
 
 图切片以已观测节点为单位：共享 message batch 保留完整捕获内容，不推测批次内单条消息的贡献；合并记忆真实依赖的多个来源均属于相关祖先。当前 trace 原有节点不被裁剪，开关关闭后也不删除历史连线。
 
@@ -354,7 +354,7 @@ writer 每次最终 Search 扫描当前用户的 JSON 历史，临时索引大�
 | 层级 | 内容 | 自动继承情况 |
 | --- | --- | --- |
 | 节点 `TraceValue.metadata` | 第 2 节列出的值身份、阶段、列表条目数或输入参数 | 不自动继承事件 metadata、HookContext.attributes 或源记忆的完整 metadata |
-| 事件 `TraceEvent.metadata` | 第 3/4 节列出的本次操作参数和结果说明 | `_event()` 在 subject.operation_id 非 `None` 时用 setdefault 补 `operation_id` |
+| 事件 `TraceEvent.metadata` | 第 3/4 节列出的本次操作参数和结果说明 | `_event()` 从 Hook subject 用 setdefault 补 `operation_id` |
 | 导出 operation metadata | 事件 metadata，加关联公共字段 | 公共字段覆盖事件 metadata 同名项 |
 | 导出 edge metadata | operation metadata，加 `TraceLink.metadata` | link 字段优先；持久化边额外有 pair_index/input_index |
 | 导出 session metadata | 单独构造的事件关联字段 | 不自动复制完整 event metadata |
@@ -385,7 +385,7 @@ session_metadata = {
 
 内置 handler 为事件及每条边分别提供说明；自定义 `TraceLink.comment=None` 仍继承操作说明。说明文字不放进 metadata，也不参与节点身份或跨阶段匹配。
 
-持久化配对边和可选的 Add → Search 关联边显式添加 link metadata，其他 handler 边使用空字典并继承 operation metadata。
+持久化配对边和可选的 Search → Add 关联边显式添加 link metadata，其他 handler 边使用空字典并继承 operation metadata。
 
 ## 6. 快照、导出与边界
 
@@ -394,7 +394,7 @@ session_metadata = {
 | 规则 | 当前行为 |
 | --- | --- |
 | 字符串长度 | 默认保留前 20,000 字符，超出追加 `…`；限制按每个字符串计算 |
-| 容器大小 | 默认每层最多 200 项，附截断提示；Search 结果和过滤列表逐项快照，保留全部外层条目 |
+| 容器大小 | 默认每层最多 200 项，附截断提示；Search 结果列表逐项快照，保留全部外层条目 |
 | 敏感字段 | 字段名规范化后包含 api_key/apikey/access_key/password/secret/authorization/cookie/credential/token 时，值替换为 `<redacted>` |
 | 向量字段 | embedding/embeddings/vector/vectors 的值替换为 `<omitted-vector:长度>` |
 | argument/arguments JSON 字符串 | 先解析并递归脱敏，再编码和截断；不能解析为 dict/list 则替换为 `<omitted-unparseable-arguments>` |
@@ -416,7 +416,7 @@ session_metadata = {
 阅读顺序：
 
 - `add_handler.py`：同步 Add 回调 → MemRead 回调及调度流程 → 消息关联状态 → 节点构造 → 来源配对。
-- `search_handler.py`：按阶段排列的回调 → 列表阶段链路 → raw 分桶分支 → 列表快照 → 过滤差集 → operation 清理。
+- `search_handler.py`：按阶段排列的回调 → 列表阶段链路 → raw 分桶分支 → 列表快照 → 过滤数量统计 → operation 清理。
 - `base.py`：上下文字段适配 → 快照/事件构造与提交 → Hook 关联 → 公用失败节点与去重。
 - `adapter.py`：请求侧 start/submit/flush/close → 工作线程的快照读写 → 缓存管理与处理循环。
 - `storage.py`：用户身份与短哈希 → 固定请求目录 → 图和元数据原子写入 → 用户索引与历史图查找。
@@ -428,7 +428,7 @@ session_metadata = {
 | Add 身份与 metadata | [add_handler.py](handlers/add_handler.py)：`_message_value`、`_extracted_memory_value`、`_persisted_memory_value`、`_enhanced_memory_value` |
 | 返回 ID 怎么连回输入 | [add_handler.py](handlers/add_handler.py)：`_persistence_values`、`_persistence_lineage` |
 | 后台增强的来源关系 | [add_handler.py](handlers/add_handler.py)：`_fine_transfer_values`、`_on_scheduler_memory_operation` |
-| 搜索列表、阶段连线和过滤内容 | [search_handler.py](handlers/search_handler.py)：`_on_search_results`、`_search_result_buckets`、`_search_memory_list_value`、`_removed_memories` |
+| 搜索列表、阶段连线和过滤数量 | [search_handler.py](handlers/search_handler.py)：`_on_search_results`、`_search_result_buckets`、`_search_memory_list_value`、`_removed_memory_count` |
 | 图中身份、metadata、占位补全 | [recorder.py](recorder.py)：`_as_comment_item`、`record`、`_complete_memory_snapshots` |
 | 快照与落盘 | [serialization.py](serialization.py)、[adapter.py](adapter.py) |
 

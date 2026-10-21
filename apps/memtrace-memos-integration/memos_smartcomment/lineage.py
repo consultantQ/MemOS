@@ -157,18 +157,21 @@ def connect_search_lineage(
     event: TraceEvent,
     sources: Iterable[dict[str, Any]],
 ) -> tuple[dict[str, Any], TraceEvent | None]:
-    """Return a detached graph slice and an explicit persisted-memory -> list event."""
-    targets: list[tuple[tuple[str, str], TraceValue]] = []
+    """Return a detached Add slice and explicit final-list -> persisted-memory links."""
+    hits: list[tuple[tuple[str, str], TraceValue, int, Any]] = []
     for output in event.outputs:
-        if output.category != "search_memory_list" or output.metadata.get("stage") != "rerank":
+        if (
+            output.category != "search_memory_list_rerank"
+            or output.metadata.get("stage") != "rerank"
+        ):
             continue
         seen = set()
-        for entry in output.value:
+        for rank, entry in enumerate(output.value, start=1):
             key = _memory_key(output.metadata.get("cube_id"), entry.get("memory_id"))
             if key is not None and key not in seen:
-                targets.append((key, output))
+                hits.append((key, output, rank, entry.get("score")))
                 seen.add(key)
-    if not targets:
+    if not hits:
         return current, None
 
     ancestry = _Ancestry()
@@ -177,8 +180,8 @@ def connect_search_lineage(
             ancestry.include(source)
     ancestry.include(current)
     roots = ancestry.roots()
-    matched = [(key, target) for key, target in targets if key in roots]
-    selected = ancestry.slice(roots[key] for key, _ in matched)
+    matched = [(key, result, rank, score) for key, result, rank, score in hits if key in roots]
+    selected = ancestry.slice(roots[key] for key, _result, _rank, _score in matched)
     merged = deepcopy(current)
     for field, id_field in _IDS.items():
         items = {item[id_field]: item for item in merged["data"][field]}
@@ -199,9 +202,12 @@ def connect_search_lineage(
         merged["data"][field] = list(items.values())
 
     links = []
-    for key, target in matched:
+    for key, result, rank, score in matched:
         node = ancestry.items["nodes"][roots[key]]
-        source = TraceValue(
+
+        score_str = f"{float(score):.3f}" if score is not None else "unknown"
+
+        memory = TraceValue(
             value=json.loads(node["value"]),
             identity=node["name"],
             category=node["category"],
@@ -210,16 +216,22 @@ def connect_search_lineage(
             comment=node.get("comment"),
             metadata=deepcopy(node["metadata"]),
         )
+
         links.append(
             TraceLink(
-                source=source,
-                target=replace(target, identity_only=True),
+                source=replace(result, identity_only=True),
+                target=memory,
                 category="memory_search_lineage",
-                comment="This persisted memory is retrieved in the final search result list.",
+                comment=(
+                    f"Retrieve this memory at rank={rank}, "
+                    f"score={score_str} in the final search result list."
+                ),
                 metadata={
                     "cube_id": key[0],
                     "memory_id": key[1],
                     "source_trace_id": node["graph_id"],
+                    "rank": rank,
+                    "score": score,
                 },
             )
         )
@@ -235,15 +247,11 @@ def connect_search_lineage(
         metadata={
             "memos_stage": "search.results.after_rerank",
             "operation_id": event.metadata.get("operation_id"),
-            "requested_count": len(targets),
+            "requested_count": len(hits),
             "linked_count": len(matched),
-            "unresolved_count": len(targets) - len(matched),
+            "unresolved_count": len(hits) - len(matched),
             "lineage_status": (
-                "resolved"
-                if len(matched) == len(targets)
-                else "partial"
-                if matched
-                else "unresolved"
+                "resolved" if len(matched) == len(hits) else "partial" if matched else "unresolved"
             ),
         },
     )

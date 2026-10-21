@@ -148,7 +148,8 @@ def hookable(
     Auto-declares before/after Hooks (idempotent); no need to manually define_hook in hook_defs.py.
     Supports piped return values: before can modify request, after can modify result.
     When ``context_builder`` is provided, one context is built before the first
-    Hook and passed to both Hooks and the decorated method as ``hook_context``.
+    Hook and passed to both Hooks as ``hook_context``. It is also passed to the
+    decorated method when that method accepts it.
     Compatible with both sync and async methods.
     """
     from memos.plugins.hook_defs import define_hook
@@ -184,7 +185,8 @@ def hookable(
                 call_kwargs = dict(kwargs)
                 if context_builder is not None:
                     before_kwargs["hook_context"] = hook_context
-                    call_kwargs["hook_context"] = hook_context
+                    if _accepts_hook_context(func):
+                        call_kwargs["hook_context"] = hook_context
 
                 rv = trigger_hook(f"{name}.before", **before_kwargs)
                 request = rv if rv is not None else request
@@ -207,7 +209,8 @@ def hookable(
             call_kwargs = dict(kwargs)
             if context_builder is not None:
                 before_kwargs["hook_context"] = hook_context
-                call_kwargs["hook_context"] = hook_context
+                if _accepts_hook_context(func):
+                    call_kwargs["hook_context"] = hook_context
 
             rv = trigger_hook(f"{name}.before", **before_kwargs)
             request = rv if rv is not None else request

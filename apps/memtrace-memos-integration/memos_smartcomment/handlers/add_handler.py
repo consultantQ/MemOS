@@ -520,23 +520,19 @@ class AddHandler(BaseHandler):
         )
 
     # Background memory maintenance
-    # MemRead refines stored memories, writes enhanced candidates, and archives
-    # or removes source memories. The scheduler operation selects the relevant
-    # memory flow and records its inputs and outputs. Archival, deletion, and
-    # failures link the affected memories to an operation status.
+    # MemRead observes refinement, enhanced writes, and source-memory removal.
+    # Deletion and failures link the affected memories to an operation status.
     def on_scheduler_memory_operation_after(
         self,
         *,
         hook_context: HookContext,
         operation: Any,
-        target: Any,
         operation_input: Any,
         result: Any,
     ) -> None:
         self._on_scheduler_memory_operation(
             hook_context=hook_context,
             operation=operation,
-            target=target,
             operation_input=operation_input,
             result=result,
             status="after",
@@ -547,14 +543,12 @@ class AddHandler(BaseHandler):
         *,
         hook_context: HookContext,
         operation: Any,
-        target: Any,
         operation_input: Any,
         error: BaseException,
     ) -> None:
         self._on_scheduler_memory_operation(
             hook_context=hook_context,
             operation=operation,
-            target=target,
             operation_input=operation_input,
             error=error,
             status="failed",
@@ -565,7 +559,6 @@ class AddHandler(BaseHandler):
         *,
         hook_context: HookContext,
         operation: Any,
-        target: Any,
         operation_input: Any,
         result: Any | None = None,
         error: BaseException | None = None,
@@ -580,9 +573,7 @@ class AddHandler(BaseHandler):
         description = {
             "fine_transfer_simple_mem": "Refine source memories into enhanced memories",
             "add_enhanced_memories": "Write enhanced memories and observe returned memory IDs",
-            "archive_merged_memories": "Mark merged source memories as archived",
             "remove_memories": "deletion of source memories",
-            "remove_source_memories": "deletion of source memories",
         }.get(operation_name, f"Run MemRead Scheduler operation {operation_name}")
         outcome = "the method returned" if status == "after" else "an exception reached the Hook"
         operation_comment = f"{description} (backend operation: {operation}); {outcome}."
@@ -623,11 +614,7 @@ class AddHandler(BaseHandler):
                 category = "scheduler_operation_failed"
                 link_comment = "Raise an observed exception."
                 value_comment = f"An observed exception {error!s} occurred."
-            elif operation_name == "archive_merged_memories":
-                category = "memory_archival"
-                link_comment = "Archive the memory unit."
-                value_comment = "The memory unit has been archived successfully."
-            elif operation_name in {"remove_memories", "remove_source_memories"}:
+            elif operation_name == "remove_memories":
                 category = "memory_deletion"
                 link_comment = f"Remove the memory unit through the {operation} operation."
                 value_comment = (
@@ -661,7 +648,6 @@ class AddHandler(BaseHandler):
             "handler": "mem_read",
             "operation_name": operation_name,
             "operation": operation,
-            "target": target,
             "status": status,
         }
         if operation_name == "fine_transfer_simple_mem":

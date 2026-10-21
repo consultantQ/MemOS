@@ -74,8 +74,6 @@ class SearchHandler(BaseHandler):
     def handle_search_memories(
         self,
         search_req: APISearchRequest,
-        *,
-        hook_context: HookContext | None = None,
     ) -> SearchResponse:
         """
         Main handler for search memories endpoint.
@@ -85,8 +83,6 @@ class SearchHandler(BaseHandler):
 
         Args:
             search_req: Search request containing query and parameters
-            hook_context: Internal correlation context shared by all Hooks for
-                this search operation. A context is created when omitted.
 
         Returns:
             SearchResponse with formatted results
@@ -108,7 +104,7 @@ class SearchHandler(BaseHandler):
         results = cube_view.search_memories(search_req_local)
         hooked_results = trigger_hook(
             H.SEARCH_MEMORY_RESULTS,
-            hook_context=hook_context,
+            hook_context=self._build_search_hook_context(search_req_local),
             handler=self,
             search_req=search_req_local,
             results=results,
@@ -122,7 +118,7 @@ class SearchHandler(BaseHandler):
             results = self._apply_relativity_threshold(results, search_req_local.relativity)
             hooked_results = trigger_hook(
                 H.SEARCH_RESULTS_AFTER_THRESHOLD,
-                hook_context=hook_context,
+                hook_context=self._build_search_hook_context(search_req_local),
                 handler=self,
                 search_req=search_req_local,
                 results=results,
@@ -139,7 +135,7 @@ class SearchHandler(BaseHandler):
                 self._strip_embeddings(results)
             hooked_results = trigger_hook(
                 H.SEARCH_RESULTS_AFTER_DEDUP,
-                hook_context=hook_context,
+                hook_context=self._build_search_hook_context(search_req_local),
                 handler=self,
                 search_req=search_req_local,
                 results=results,
@@ -157,7 +153,7 @@ class SearchHandler(BaseHandler):
             )
             hooked_results = trigger_hook(
                 H.SEARCH_RESULTS_AFTER_RERANK,
-                hook_context=hook_context,
+                hook_context=self._build_search_hook_context(search_req_local),
                 handler=self,
                 search_req=search_req_local,
                 results=results,
@@ -167,7 +163,7 @@ class SearchHandler(BaseHandler):
         except Exception as error:
             trigger_hook(
                 H.SEARCH_POST_PROCESS_FAILED,
-                hook_context=hook_context,
+                hook_context=self._build_search_hook_context(search_req_local),
                 handler=self,
                 search_req=search_req_local,
                 error=error,
@@ -176,7 +172,7 @@ class SearchHandler(BaseHandler):
 
         hooked_results = trigger_hook(
             H.SEARCH_CONTEXT_RENDER,
-            hook_context=hook_context,
+            hook_context=self._build_search_hook_context(search_req_local),
             handler=self,
             search_req=search_req_local,
             results=results,

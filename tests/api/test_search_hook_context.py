@@ -1,3 +1,5 @@
+import inspect
+
 import pytest
 
 from memos.api.handlers.base_handler import HandlerDependencies
@@ -47,7 +49,7 @@ def _search_handler() -> tuple[SearchHandler, _CubeView]:
     return handler, cube_view
 
 
-def test_search_success_hooks_run_in_order_and_share_context(monkeypatch):
+def test_search_success_hooks_run_in_order_with_distinct_stage_operations(monkeypatch):
     events = []
     result_hook_calls = []
     handler, cube_view = _search_handler()
@@ -97,7 +99,8 @@ def test_search_success_hooks_run_in_order_and_share_context(monkeypatch):
         H.SEARCH_AFTER,
     ]
     contexts = [context for _name, context in events]
-    assert all(context is contexts[0] for context in contexts)
+    assert contexts[-1] is contexts[0]
+    assert len({context.operation_id for context in contexts}) == 6
     context = contexts[0]
     assert isinstance(context, HookContext)
     assert context.trace_id == "trace-1"
@@ -107,6 +110,13 @@ def test_search_success_hooks_run_in_order_and_share_context(monkeypatch):
     assert context.source == "api.search"
     assert context.attributes == {"mode": "fast"}
     assert context.operation_id
+    for stage_context in contexts[1:-1]:
+        assert stage_context.source == "api.search"
+        assert stage_context.operation_id != context.operation_id
+        assert stage_context.attributes == {"mode": "fast"}
+        assert stage_context.attributes is not context.attributes
+        for field in ("trace_id", "user_id", "session_id", "task_id", "cube_ids"):
+            assert getattr(stage_context, field) == getattr(context, field)
     assert cube_view.request.query == "hooked query"
     assert all(call["handler"] is handler for call in result_hook_calls)
     assert all(call["search_req"] is cube_view.request for call in result_hook_calls)
@@ -143,23 +153,42 @@ def test_search_result_hooks_replace_memories_in_response(hook_name):
     assert response.data["text_mem"][0]["memories"] == [memory]
 
 
-def test_search_post_processing_failure_triggers_only_failure_hook(monkeypatch):
+@pytest.mark.parametrize("failed_stage", ["threshold", "dedup", "rerank"])
+def test_search_post_processing_failure_identifies_the_failed_operation(monkeypatch, failed_stage):
     error = RuntimeError("post processing failed")
     events = []
     handler, _cube_view = _search_handler()
-    search_req = APISearchRequest(user_id="user", query="query")
+    search_req = APISearchRequest(user_id="user", query="query", dedup="sim")
+    observed_contexts = []
+    register_hook(
+        H.SEARCH_BEFORE, lambda **kwargs: observed_contexts.append(kwargs["hook_context"])
+    )
+    for name in (
+        H.SEARCH_MEMORY_RESULTS,
+        H.SEARCH_RESULTS_AFTER_THRESHOLD,
+        H.SEARCH_RESULTS_AFTER_DEDUP,
+        H.SEARCH_RESULTS_AFTER_RERANK,
+    ):
+        register_hook(name, lambda **kwargs: observed_contexts.append(kwargs["hook_context"]))
     monkeypatch.setattr(
         "memos.api.handlers.search_handler.get_current_trace_id",
         lambda: "trace-1",
     )
 
-    def fail_post_processing(_results, _relativity):
+    def fail_post_processing(*_args, **_kwargs):
         raise error
 
     def record_failure(**kwargs):
         events.append((H.SEARCH_POST_PROCESS_FAILED, kwargs))
 
-    handler._apply_relativity_threshold = fail_post_processing
+    if failed_stage == "threshold":
+        handler._apply_relativity_threshold = fail_post_processing
+    elif failed_stage == "dedup":
+        handler._dedup_text_memories = fail_post_processing
+    else:
+        monkeypatch.setattr(
+            "memos.api.handlers.search_handler.rerank_knowledge_mem", fail_post_processing
+        )
     register_hook(H.SEARCH_POST_PROCESS_FAILED, record_failure)
     register_hook(H.SEARCH_CONTEXT_RENDER, lambda **_kwargs: events.append(("render", {})))
     register_hook(H.SEARCH_AFTER, lambda **_kwargs: events.append(("after", {})))
@@ -176,3 +205,32 @@ def test_search_post_processing_failure_triggers_only_failure_hook(monkeypatch):
     context = failure["hook_context"]
     assert context.trace_id == "trace-1"
     assert context.user_id == "user"
+    assert context.source == "api.search"
+    assert context.attributes == {"mode": "fast"}
+    assert context.operation_id not in {prior.operation_id for prior in observed_contexts}
+
+
+def test_search_handler_does_not_accept_hook_context():
+    assert list(inspect.signature(SearchHandler.handle_search_memories).parameters) == [
+        "self",
+        "search_req",
+    ]
+
+
+def test_search_stage_operations_stay_isolated_between_searches_in_one_trace(monkeypatch):
+    handler, _cube_view = _search_handler()
+    monkeypatch.setattr(
+        "memos.api.handlers.search_handler.get_current_trace_id", lambda: "one-trace"
+    )
+    contexts = []
+    for name in (
+        H.SEARCH_BEFORE,
+        H.SEARCH_RESULTS_AFTER_THRESHOLD,
+        H.SEARCH_RESULTS_AFTER_DEDUP,
+        H.SEARCH_RESULTS_AFTER_RERANK,
+    ):
+        register_hook(name, lambda **kwargs: contexts.append(kwargs["hook_context"]))
+    for query in ("first", "second"):
+        handler.handle_search_memories(APISearchRequest(user_id="user", query=query))
+    assert len({context.operation_id for context in contexts}) == 8
+    assert all(context.attributes == {"mode": "fast"} for context in contexts)

@@ -1,4 +1,4 @@
-"""Capture Search result lists and the memories removed between stages."""
+"""Capture retained Search result lists at each observed stage."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ class SearchHandler(BaseHandler):
         max_value_chars: int = 20_000,
     ) -> None:
         super().__init__(submit, max_value_chars=max_value_chars)
-        self._search_stages: dict[tuple[str, str], dict[_BucketKey, _SearchList]] = {}
+        self._search_stages: dict[str, dict[_BucketKey, _SearchList]] = {}
         self._search_stages_lock = Lock()
 
     def clear(self) -> None:
@@ -88,8 +88,8 @@ class SearchHandler(BaseHandler):
 
     # Query intake and search identity
     # A search starts with a query and the readable cubes from its request.
-    # Hook context and request fields place that query in a user trace and
-    # operation scope. Every result stage refers to the same query identity.
+    # Hook context and request fields place that query in a user trace.
+    # Every result stage refers to the same query identity.
     def on_search_before(
         self,
         *,
@@ -125,12 +125,6 @@ class SearchHandler(BaseHandler):
             subject["mem_cube_ids"] = cube_ids
         return subject
 
-    @staticmethod
-    def _search_scope_id(subject: Any) -> str:
-        """Identify one search operation within a possibly shared trace."""
-        operation_id = _get(subject, "operation_id")
-        return str(operation_id) if operation_id is not None else _current_trace_id(subject)
-
     def _search_query_value(
         self,
         subject: Any,
@@ -138,10 +132,10 @@ class SearchHandler(BaseHandler):
         *,
         identity_only: bool,
     ) -> TraceValue:
-        search_scope_id = self._search_scope_id(subject)
+        trace_id = _current_trace_id(subject)
         return self._value(
             value=_get(request, "query", ""),
-            identity=f"search_query:{search_scope_id}",
+            identity=f"search_query:{trace_id}",
             category="search_query",
             class_name="str",
             identity_only=identity_only,
@@ -152,7 +146,7 @@ class SearchHandler(BaseHandler):
     # Retrieved candidates
     # Retrieval returns candidates grouped by memory type and storage cube.
     # Each bucket becomes one list node, preserving the observed memory order.
-    # Stage links connect entire lists; removed memories form a separate list.
+    # Stage links connect the retained lists at successive observed stages.
     def on_search_memory_results(
         self,
         *,
@@ -273,7 +267,7 @@ class SearchHandler(BaseHandler):
             return
         subject = self._search_subject(hook_context, request)
         buckets = self._search_result_buckets(results)
-        scope_key = self._search_scope_key(subject)
+        trace_id = _current_trace_id(subject)
 
         stage_label = _SEARCH_STAGE_LABELS.get(stage, stage)
         retained_comment = {
@@ -300,7 +294,7 @@ class SearchHandler(BaseHandler):
         )
         with self._search_stages_lock:
             # Skipped or missing stages leave the last observed lists as predecessors.
-            previous = self._search_stages.pop(scope_key, {})
+            previous = self._search_stages.pop(trace_id, {})
         if stage == "raw":
             previous = {}
 
@@ -339,33 +333,17 @@ class SearchHandler(BaseHandler):
                         source=source,
                         target=result.node,
                         category=_SEARCH_LINK_CATEGORIES[stage],
-                        comment=f"Process memory candidates through the {stage_label} stage.",
+                        comment=f"Filter memory candidates through the {stage_label} stage.",
                     )
                 )
-                removed = self._removed_memories(prior.bucket.memories, result.bucket.memories)
-                if removed:
-                    filtered = self._search_memory_list_value(
-                        subject,
-                        stage=stage,
-                        bucket=replace(prior.bucket, memories=removed),
-                        filtered=True,
-                        retained_comment=retained_comment,
-                    )
-                    outputs += (filtered,)
-                    filtered_count += len(removed)
-                    stage_links.append(
-                        TraceLink(
-                            source=source,
-                            target=filtered,
-                            category="memory_filtered",
-                            comment=f"Filter memory candidates through the {stage_label} stage.",
-                        )
-                    )
+                filtered_count += self._removed_memory_count(
+                    prior.bucket.memories, result.bucket.memories
+                )
             links = tuple(stage_links)
             inputs = self._unique_values([link.source for link in links])
 
         with self._search_stages_lock:
-            self._search_stages[scope_key] = current
+            self._search_stages[trace_id] = current
 
         event_metadata = {
             **metadata,
@@ -384,7 +362,7 @@ class SearchHandler(BaseHandler):
                 metadata=event_metadata,
             )
         )
-        # Rerank and failure are terminal stages for this operation's cache.
+        # Rerank and failure are terminal stages for this trace's cache.
         if stage == "rerank":
             self._clear_search_stages(subject)
 
@@ -396,7 +374,7 @@ class SearchHandler(BaseHandler):
         results: tuple[_SearchList, ...],
     ) -> tuple[tuple[TraceValue, ...], tuple[TraceLink, ...]]:
         """Expand raw retrieval into query -> result type -> cube -> memory list."""
-        search_scope_id = self._search_scope_id(subject)
+        trace_id = _current_trace_id(subject)
         types: dict[str, TraceValue] = {}
         branches: list[TraceValue] = []
         links: list[TraceLink] = []
@@ -406,7 +384,7 @@ class SearchHandler(BaseHandler):
             if result_type not in types:
                 type_node = self._value(
                     value=result_type,
-                    identity=f"search_memory_type:{search_scope_id}:{result_type}",
+                    identity=f"search_memory_type:{trace_id}:{result_type}",
                     category="search_memory_type",
                     class_name="search_memory_type",
                     identity_only=False,
@@ -428,7 +406,7 @@ class SearchHandler(BaseHandler):
             cube_label = cube_id if cube_id is not None else f"bucket-{bucket.bucket_index}"
             cube_node = self._value(
                 value=cube_label,
-                identity=f"search_cube:{search_scope_id}:{result_type}:{bucket.bucket_index}",
+                identity=f"search_cube:{trace_id}:{result_type}:{bucket.bucket_index}",
                 category="search_cube",
                 class_name="search_cube",
                 identity_only=False,
@@ -500,7 +478,7 @@ class SearchHandler(BaseHandler):
                     cube_id=cube_id,
                     bucket_index=bucket_index,
                     occurrence=occurrence,
-                    # Keep full content for list differences before display truncation.
+                    # Count anonymous removals before display truncation.
                     memories=deepcopy(items),
                 )
                 buckets[bucket.key] = bucket
@@ -513,9 +491,7 @@ class SearchHandler(BaseHandler):
         stage: str,
         bucket: _SearchBucket,
         retained_comment: str = "",
-        filtered: bool = False,
     ) -> TraceValue:
-        category = "search_filter_result" if filtered else "search_memory_list"
         # DOT renderers interpolate IDs inside quotes; encode the structured key
         # so its quotes and backslashes cannot split one node into multiple IDs.
         bucket_key = quote(
@@ -529,66 +505,38 @@ class SearchHandler(BaseHandler):
             "memory_count": len(bucket.memories),
         }
 
-        if filtered:
-            metadata["status"] = "filtered"
         return TraceValue(
             # Bound each entry's fields without truncating the outer result list.
             value=[self._snapshot(memory) for memory in bucket.memories],
-            identity=f"{category}:{self._search_scope_id(subject)}:{stage}:{bucket_key}",
-            category=category,
+            identity=f"search_memory_list:{_current_trace_id(subject)}:{stage}:{bucket_key}",
+            category=f"search_memory_list_{stage}",
             class_name="search_memory_list",
-            comment=(
-                f"Memories filtered out during the {stage} stage." if filtered else retained_comment
-            ),
+            comment=retained_comment,
             metadata=self._snapshot(metadata),
         )
 
-    def _search_scope_key(self, subject: Any) -> tuple[str, str]:
-        return (
-            _current_trace_id(subject),
-            self._search_scope_id(subject),
-        )
-
     @staticmethod
-    def _removed_memories(
-        previous: list[dict[str, Any]], current: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """List multiset difference for reporting removals, never for graph links."""
-
-        def encode(value: Any) -> str:
-            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    def _removed_memory_count(previous: list[dict[str, Any]], current: list[dict[str, Any]]) -> int:
+        """Count removed occurrences without creating a discarded-memory list."""
 
         def identity(memory: dict[str, Any]) -> str:
             memory_id = memory["memory_id"]
-            return encode(
-                ["id", str(memory_id)] if memory_id is not None else ["text", memory["memory"]]
+            return json.dumps(
+                ["id", str(memory_id)] if memory_id is not None else ["text", memory["memory"]],
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
             )
 
-        remaining = Counter(identity(memory) for memory in current)
-        exact = Counter(encode(memory) for memory in current)
-        unmatched = []
-        # Preserve the right occurrence when equal IDs have different scores/text.
-        for memory in previous:
-            snapshot = encode(memory)
-            if exact[snapshot]:
-                exact[snapshot] -= 1
-                remaining[identity(memory)] -= 1
-            else:
-                unmatched.append(memory)
-        removed = []
-        for memory in unmatched:
-            key = identity(memory)
-            if remaining[key]:
-                # The same memory can gain expanded text or a new score during rerank.
-                remaining[key] -= 1
-            else:
-                removed.append(memory)
-        return removed
+        # Scores and expanded text can change while the same memory is retained.
+        before = Counter(identity(memory) for memory in previous)
+        after = Counter(identity(memory) for memory in current)
+        return sum((before - after).values())
 
     # Search completion
     # Reranking completes the search result flow. A post-processing exception
     # links the query to a failure status. Both outcomes release the cached
-    # result lists for that search operation.
+    # result lists for that trace.
     def on_search_post_process_failed(
         self,
         *,
@@ -630,4 +578,4 @@ class SearchHandler(BaseHandler):
 
     def _clear_search_stages(self, subject: Any) -> None:
         with self._search_stages_lock:
-            self._search_stages.pop(self._search_scope_key(subject), None)
+            self._search_stages.pop(_current_trace_id(subject), None)
