@@ -186,3 +186,26 @@ def test_hookable_shares_and_reuses_context_for_async_operation():
         ("operation", supplied_context),
         ("after", supplied_context),
     ]
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_hookable_supports_method_without_context_parameter(is_async):
+    context = build_hook_context(source="test")
+    observed = []
+
+    async def async_run(self, request):
+        return request
+
+    def sync_run(self, request):
+        return request
+
+    class Handler:
+        run = hookable("without_context", context_builder=lambda _self, _request: context)(
+            async_run if is_async else sync_run
+        )
+
+    for name in ("without_context.before", "without_context.after"):
+        register_hook(name, lambda **kwargs: observed.append(kwargs["hook_context"]))
+    result = Handler().run("request")
+    assert (asyncio.run(result) if is_async else result) == "request"
+    assert observed == [context, context]

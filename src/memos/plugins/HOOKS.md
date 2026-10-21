@@ -85,11 +85,10 @@ Hooks that do **not** provide context will never pass it, even if you declare th
 
 ### Context scope
 
-- All hooks in one **search** invocation share the same context object. It is built before
-  `search.before`, so replacing the request does not rebuild the context. Use the callback's
-  `request` argument for the current business input.
+- **Search** builds a context for `search.before` and `search.after`. Each intermediate
+  hook creates its own context.
 - **Reader extraction**, **cube writes**, and **scheduler operations** each create a separate
-  context. Do not assume they share an `operation_id`; use `trace_id` or `task_id` for
+  context. Use `trace_id` or `task_id` for
   broader correlation.
 
 ---
@@ -109,8 +108,6 @@ search.before
                           └─► SearchResponse construction
                               └─► search.after
 ```
-
-Every hook receives `hook_context`. Context source: `api.search`; attributes contain `mode`.
 
 | Constant / Hook name | Additional arguments | `pipe_key` | Typical use |
 | --- | --- | --- | --- |
