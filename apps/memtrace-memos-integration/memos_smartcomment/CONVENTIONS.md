@@ -90,7 +90,7 @@ cube 列表取第一个非空字段：`writable_cube_ids → readable_cube_ids �
 
 ## 2. `TraceValue` 节点总表
 
-下面的 `{cube}` 在 Add 链中表示 `cube_id or 'unknown'`；`{trace}` 为解析后的 trace，也是 Search 各阶段的关联依据。`{status}` 在调度链中为 `after` 或 `failed`。
+下面的 `{cube}` 在 Add 链中表示 `cube_id or 'unknown'`；`{trace}` 为解析后的 trace。Search 的 `{search}` 为 `{trace}:{uuid4.hex}`，在首次观察结果时分配，由同一请求的后续阶段复用。`{status}` 在调度链中为 `after` 或 `failed`。
 
 ### 2.1 AddHandler：输入、提取、持久化与后台增强
 
@@ -125,10 +125,12 @@ Recorder 对导出的 `persisted_memory.metadata` 额外添加 `snapshot_status=
 
 | 业务含义 | `category` | `class_name` | `identity` | `value` |
 | --- | --- | --- | --- | --- |
-| 搜索查询 | `search_query` | `str` | `search_query:{trace}` | 请求 query；无字段时默认空字符串 |
-| 召回类型分支 | `search_memory_type` | `search_memory_type` | `search_memory_type:{trace}:{result_type}` | results 顶层类型字符串，例如 `text_mem`、`tool_mem` |
-| 召回 cube 分支 | `search_cube` | `search_cube` | `search_cube:{trace}:{result_type}:{bucket_index}` | cube ID；缺失时为 `bucket-{bucket_index}` |
-| 阶段结果列表 | `search_memory_list_{stage}` | `search_memory_list` | `search_memory_list:{trace}:{stage}:{bucket_key}` | 当前桶的记忆列表，每项包含 `memory_id`、`memory`、`score` |
+| 搜索查询 | `search_query` | `str` | `search_query:{trace}:{query_digest}` | 请求 query；无字段时默认空字符串 |
+| 召回类型分支 | `search_memory_type` | `search_memory_type` | `search_memory_type:{search}:{result_type}` | results 顶层类型字符串，例如 `text_mem`、`tool_mem` |
+| 召回 cube 分支 | `search_cube` | `search_cube` | `search_cube:{search}:{result_type}:{bucket_index}` | cube ID；缺失时为 `bucket-{bucket_index}` |
+| 阶段结果列表 | `search_memory_list_{stage}` | `search_memory_list` | `search_memory_list:{search}:{stage}:{bucket_key}` | 当前桶的记忆列表，每项包含 `memory_id`、`memory`、`score` |
+
+`query_digest` 是捕获后 query 值的 JSON 编码的 SHA256 摘要，使 `search.before` 的原请求与结果 Hook 的工作副本引用同一查询。同一用户/trace 内相同的查询快照可以共享查询节点，结果阶段的命名空间仍按请求独立。内存阶段状态按 `(user_id, trace_id, id(request))` 隔离，并持有请求对象，防止对象 ID 在状态存续期间被复用；后台事件只持有已捕获的值和命名空间，不持有请求。rerank、后处理异常和捕获异常清理对应状态，shutdown 清理全部状态。本实现不按容量或 TTL 淘汰待完成 Search，缺失终止 Hook 的状态可能保留至关闭。
 
 | 搜索身份/位置字段 | 规则 |
 | --- | --- |
@@ -326,9 +328,9 @@ API 后处理当前始终调用 `rerank_knowledge_mem`，因此收到 rerank Hoo
 
 四个结果阶段另加 `link_strategy="bucket_lists"` 和 `filtered_count`。raw 阶段 filtered_count 为 0；其余阶段为相对最近记录阶段、所有桶移除的条目数之和。rerank 的 algorithm/order_by/direction 是插件当前固定写入的描述，不是对实际后端算法的动态识别；插件也不自己重新过滤、去重或排序。`top_k` 是当前 Hook 请求中的值，可能已经被业务层扩充。
 
-缓存以 trace_id 为键，只保存该 trace 最近实际记录阶段的列表快照，按 bucket_key 索引。已记录阶段替换前一份快照；关闭的阶段不触碰缓存，raw 开始时丢弃该 trace 的旧快照；rerank 和 post_process.failed 清理该 trace 的缓存，shutdown 清理全部。
+缓存按第 2.2 节的用户、trace 和请求对象隔离，只保存该请求最近实际记录阶段的列表快照，按 bucket_key 索引。已记录阶段替换前一份快照；关闭的阶段不触碰缓存；raw 开始时重建该请求的状态和结果命名空间，rerank 和 post_process.failed 清理该请求的缓存，shutdown 清理全部。
 
-各阶段事件使用对应 HookContext.operation_id，同一事件中的所有桶和连线共用该 ID。节点身份和缓存使用 trace_id；插件只消费 Hook 已提供的上下文。
+各阶段事件使用对应 HookContext.operation_id，同一事件中的所有桶和连线共用该 ID。结果节点使用该请求的命名空间，事件和图仍保留原 trace_id；插件不修改业务请求或 Hook 上下文。
 
 观测终点为 `search.results.after_rerank`；插件没有订阅 `search.context.render` 或 `search.after`。
 

@@ -12,6 +12,7 @@ from hashlib import sha256
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+from uuid import uuid4
 
 from memos_smartcomment.events import DeferredTraceEvent, TraceEvent, TraceLink, TraceValue
 from memos_smartcomment.handlers.base import (
@@ -77,6 +78,14 @@ class _SearchList:
     node: TraceValue
 
 
+@dataclass(frozen=True)
+class _SearchState:
+    # Retain the request so its object ID cannot be reused while stages are pending.
+    request: Any
+    namespace: str
+    lists: dict[_BucketKey, _SearchList]
+
+
 class SearchHandler(BaseHandler):
     """Capture one result-list node per type/cube bucket at each enabled Search stage."""
 
@@ -89,7 +98,7 @@ class SearchHandler(BaseHandler):
     ) -> None:
         super().__init__(submit, max_value_chars=max_value_chars)
         self._defer_search = defer_search
-        self._search_stages: dict[str, dict[_BucketKey, _SearchList]] = {}
+        self._search_stages: dict[tuple[str | None, str, int], _SearchState] = {}
         self._search_stages_lock = Lock()
 
     def clear(self) -> None:
@@ -144,7 +153,7 @@ class SearchHandler(BaseHandler):
         identity_only: bool,
     ) -> TraceValue:
         trace_id = _current_trace_id(subject)
-        return self._value(
+        query = self._value(
             value=_get(request, "query", ""),
             identity=f"search_query:{trace_id}",
             category="search_query",
@@ -153,6 +162,10 @@ class SearchHandler(BaseHandler):
             comment="The raw query the user uploaded for memory retrieval.",
             metadata={"memos_stage": "search.before"},
         )
+        # Before receives the original request; result Hooks receive its working copy.
+        # Match the captured query across that copy without borrowing another query's value.
+        digest = sha256(json.dumps(query.value, ensure_ascii=False).encode()).hexdigest()
+        return replace(query, identity=f"{query.identity}:{digest}")
 
     # Retrieved candidates
     # Retrieval returns candidates grouped by memory type and storage cube.
@@ -277,8 +290,13 @@ class SearchHandler(BaseHandler):
         if request is None:
             return
         subject = self._search_subject(hook_context, request)
+        request_key = self._search_cache_key(subject, request)
+        with self._search_stages_lock:
+            # Take ownership before capture so failures cannot strand this request's state.
+            state = self._search_stages.pop(request_key, None)
+        if state is None or stage == "raw":
+            state = _SearchState(request, f"{_current_trace_id(subject)}:{uuid4().hex}", {})
         buckets = self._search_result_buckets(results)
-        trace_id = _current_trace_id(subject)
 
         retained_comment = {
             "raw": (
@@ -302,11 +320,8 @@ class SearchHandler(BaseHandler):
             stage,
             f"Memory candidates retained after the {stage} stage.",
         )
-        with self._search_stages_lock:
-            # Skipped or missing stages leave the last observed lists as predecessors.
-            previous = self._search_stages.pop(trace_id, {})
-        if stage == "raw":
-            previous = {}
+        # Skipped or missing stages leave the last observed lists as predecessors.
+        previous = state.lists
 
         # A disappearing bucket still has an empty result at the next stage.
         for key, prior in previous.items():
@@ -316,17 +331,12 @@ class SearchHandler(BaseHandler):
             key: _SearchList(
                 bucket,
                 self._search_memory_list_value(
-                    subject, stage=stage, bucket=bucket, retained_comment=retained_comment
+                    state.namespace, stage=stage, bucket=bucket, retained_comment=retained_comment
                 ),
             )
             for key, bucket in buckets.items()
             if bucket.memories or key in previous
         }
-        # Keep capture-side correlation independent of writer progress and dropped events.
-        with self._search_stages_lock:
-            if stage != "rerank":
-                self._search_stages[trace_id] = current
-
         query = (
             self._search_query_value(subject, request, identity_only=True)
             if stage == "raw"
@@ -344,6 +354,7 @@ class SearchHandler(BaseHandler):
             build=partial(
                 self._build_search_event,
                 event,
+                namespace=state.namespace,
                 stage=stage,
                 query=query,
                 previous=previous,
@@ -357,11 +368,18 @@ class SearchHandler(BaseHandler):
                 self._defer_search(work)
             except Exception:
                 logger.exception("Failed to enqueue smartcomment event: %s", operation)
+                return
+
+        # Only completed captures become predecessors; writer progress is independent.
+        with self._search_stages_lock:
+            if stage != "rerank":
+                self._search_stages[request_key] = _SearchState(request, state.namespace, current)
 
     def _build_search_event(
         self,
         event: TraceEvent,
         *,
+        namespace: str,
         stage: str,
         query: TraceValue | None,
         previous: dict[_BucketKey, _SearchList],
@@ -375,7 +393,7 @@ class SearchHandler(BaseHandler):
             assert query is not None
             inputs = (query,)
             branches, links = self._search_retrieval_branches(
-                event, query=query, results=tuple(current.values())
+                namespace, query=query, results=tuple(current.values())
             )
             outputs = branches + outputs
         else:
@@ -413,13 +431,12 @@ class SearchHandler(BaseHandler):
 
     def _search_retrieval_branches(
         self,
-        subject: Any,
+        namespace: str,
         *,
         query: TraceValue,
         results: tuple[_SearchList, ...],
     ) -> tuple[tuple[TraceValue, ...], tuple[TraceLink, ...]]:
         """Expand raw retrieval into query -> result type -> cube -> memory list."""
-        trace_id = _current_trace_id(subject)
         types: dict[str, TraceValue] = {}
         branches: list[TraceValue] = []
         links: list[TraceLink] = []
@@ -429,7 +446,7 @@ class SearchHandler(BaseHandler):
             if result_type not in types:
                 type_node = self._value(
                     value=result_type,
-                    identity=f"search_memory_type:{trace_id}:{result_type}",
+                    identity=f"search_memory_type:{namespace}:{result_type}",
                     category="search_memory_type",
                     class_name="search_memory_type",
                     identity_only=False,
@@ -451,7 +468,7 @@ class SearchHandler(BaseHandler):
             cube_label = cube_id if cube_id is not None else f"bucket-{bucket.bucket_index}"
             cube_node = self._value(
                 value=cube_label,
-                identity=f"search_cube:{trace_id}:{result_type}:{bucket.bucket_index}",
+                identity=f"search_cube:{namespace}:{result_type}:{bucket.bucket_index}",
                 category="search_cube",
                 class_name="search_cube",
                 identity_only=False,
@@ -561,7 +578,7 @@ class SearchHandler(BaseHandler):
 
     def _search_memory_list_value(
         self,
-        subject: Any,
+        namespace: str,
         *,
         stage: str,
         bucket: _SearchBucket,
@@ -583,7 +600,7 @@ class SearchHandler(BaseHandler):
         return TraceValue(
             # Captured entries are already detached, redacted and bounded.
             value=bucket.memories,
-            identity=f"search_memory_list:{_current_trace_id(subject)}:{stage}:{bucket_key}",
+            identity=f"search_memory_list:{namespace}:{stage}:{bucket_key}",
             category=f"search_memory_list_{stage}",
             class_name="search_memory_list",
             comment=retained_comment,
@@ -604,7 +621,7 @@ class SearchHandler(BaseHandler):
     # Search completion
     # Reranking completes the search result flow. A post-processing exception
     # links the query to a failure status. Both outcomes release the cached
-    # result lists for that trace.
+    # result lists for that request.
     def on_search_post_process_failed(
         self,
         *,
@@ -616,6 +633,7 @@ class SearchHandler(BaseHandler):
     ) -> None:
         stage = "search.post_process.failed"
         subject = self._search_subject(hook_context, search_req)
+        self._clear_search_stages(subject, search_req)
         query = self._search_query_value(subject, search_req, identity_only=True)
         status = self._operation_status_value(subject, error, stage=stage)
         self._emit(
@@ -642,8 +660,11 @@ class SearchHandler(BaseHandler):
                 },
             )
         )
-        self._clear_search_stages(subject)
 
-    def _clear_search_stages(self, subject: Any) -> None:
+    @staticmethod
+    def _search_cache_key(subject: Any, request: Any) -> tuple[str | None, str, int]:
+        return _get(subject, "user_id"), _current_trace_id(subject), id(request)
+
+    def _clear_search_stages(self, subject: Any, request: Any) -> None:
         with self._search_stages_lock:
-            self._search_stages.pop(_current_trace_id(subject), None)
+            self._search_stages.pop(self._search_cache_key(subject, request), None)

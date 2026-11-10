@@ -10,6 +10,7 @@ import re
 import threading
 
 from collections import OrderedDict
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -63,6 +64,17 @@ def _atomic_write(path: Path, value: dict[str, Any] | str) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _reserve(path: Path, value: dict[str, Any]) -> None:
+    """Reserve a new identity without consuming a directory name on write failure."""
+    try:
+        _atomic_write(path, value)
+    except Exception:
+        # Remove only an empty reservation directory; never discard existing files.
+        with suppress(OSError):
+            path.parent.rmdir()
+        raise
 
 
 def _entry_type(event: TraceEvent) -> str:
@@ -136,7 +148,7 @@ class TraceStore:
             # An earlier colliding user may have been deleted; check longer candidates too.
         if create:
             if available is not None:
-                _atomic_write(available / "_user.json", {"user_id": user_id})
+                _reserve(available / "_user.json", {"user_id": user_id})
                 return available
             raise MemOSError("Cannot allocate a distinct memtrace user directory")
         return None
@@ -233,7 +245,7 @@ class TraceStore:
             "path": (path / "graph.json").relative_to(user).as_posix(),
         }
         # Reserve the identity before writing the graph so a failed write retries in place.
-        _atomic_write(path / "meta.json", entry)
+        _reserve(path / "meta.json", entry)
         return entry
 
     def write(self, events: Sequence[TraceEvent], graph: dict[str, Any]) -> None:

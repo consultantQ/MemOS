@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
 
 from memos_smartcomment.adapter import AsyncTraceAdapter
 from memos_smartcomment.config import SmartCommentSettings
@@ -12,6 +13,10 @@ from memos_smartcomment.handlers import HookHandlers
 from memos.log import get_logger
 from memos.plugins.base import MemOSPlugin
 from memos.plugins.hook_defs import H
+
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 
 logger = get_logger(__name__)
@@ -73,6 +78,20 @@ class SmartCommentPlugin(MemOSPlugin):
 
     def init_components(self, context: dict[str, Any]) -> None:
         self.context = context
+
+    def init_app(self) -> None:
+        original_lifespan = self._app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI) -> AsyncIterator[Mapping[str, Any] | None]:
+            try:
+                async with original_lifespan(app) as state:
+                    yield state
+            finally:
+                # Components may still emit events while shutting down.
+                self.on_shutdown()
+
+        self._app.router.lifespan_context = lifespan
 
     def on_shutdown(self) -> None:
         if self.handlers is not None:

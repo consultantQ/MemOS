@@ -136,6 +136,18 @@ Set these environment variables before loading the plugin. Restart MemOS after c
 
 Snapshots are written atomically. An idle or full in-memory cache can be evicted; a later event restores the saved graph and appends to it. Cache limits do not delete JSON files. Use a different output directory for each writer process, including when running multiple server workers.
 
+Queue, string and graph-cache limits must be positive integers. Cache TTL accepts
+positive finite seconds, including fractions. Invalid numeric environment values
+fall back to the defaults above; invalid values passed directly to
+`SmartCommentSettings` raise `ConfigurationError`. Both configuration entry points
+leave Search-to-Add history linking disabled unless explicitly enabled.
+
+The plugin closes its writer after application components finish shutting down,
+including when their cleanup raises an exception. Close waits up to five seconds
+for accepted events and pending indexes. A timeout logs a warning and leaves the
+writer running; persistent storage failures can prevent draining, and process exit
+can still lose uncommitted events.
+
 ### Connect Search results to their Add history
 
 ```bash
@@ -334,7 +346,10 @@ separate list nodes or edges. `filtered_count` still counts removed occurrences 
 buckets by memory ID (or original text for anonymous entries), including duplicates.
 Reordering, expanded text, and score changes for the same ID do not count as removals.
 
-Branches and lists use `trace_id` for stage connections. List links
+Branches and lists use a namespace allocated for each observed Search, so requests
+sharing a user and trace cannot reuse each other's stage nodes. Query identities
+include a digest of the captured value to survive the API's request copy; equal
+captured queries within a trace may share a query node. List links
 use result type, cube ID, and the occurrence of that cube within the type; buckets
 without IDs use their position. Reordered unique cube IDs remain correctly linked.
 Repeated or missing cube IDs rely on stable occurrence order or position. A new
@@ -343,9 +358,13 @@ bucket without a previous-stage list is retained without a guessed source edge.
 The plugin copies `HookContext.operation_id` unchanged into event, operation, and
 edge metadata. Optional Add-history links retain the rerank Hook's operation ID.
 
-Search observation ends at `search.results.after_rerank`. Each trace caches only
-its latest recorded lists; skipped stages leave that cache intact. Rerank and
-post-processing failure clear that trace's cache; shutdown clears all caches. The current rerank event describes
+Search observation ends at `search.results.after_rerank`. Stage state is keyed by
+user, trace and the working request object, which is retained until cleanup. Each
+request caches its latest recorded lists; skipped stages leave that state intact.
+Rerank, post-processing failure and capture failure release that request's state;
+shutdown clears all state. There is no capacity or time-based eviction of pending
+Search state, so missing terminal Hooks can retain it until shutdown.
+The current rerank event describes
 the API's descending `metadata.relativity` sort; the tracing handler preserves
 observed order and does not sort results itself.
 
@@ -432,28 +451,24 @@ operation's data contract; unknown lineage keeps its nodes without a guessed edg
 
 ## Verify the integration
 
-Run the Search-to-Add lineage regression tests from this directory:
+With the integration and its dependencies installed, run the tracked regression
+tests from the MemOS repository root. Explicit source paths select this checkout:
 
 ```bash
-PYTHONPATH=. python -m pytest tests/test_search_lineage.py -q
+PYTHONPATH=apps/memtrace-memos-integration:src python -m pytest \
+  tests/plugins/test_smartcomment_integration.py \
+  tests/plugins/test_hook_context.py tests/api/test_search_pipeline_hooks.py -q
 ```
 
-They exercise actual Add/Search hooks, final-hit selection, shared ancestors,
-cross-trace refinement, user/cube isolation, opt-in behavior, and durable restore.
-
-Run the local search-branch regression tests (ignored by Git) from this directory
-with the integration and its dependencies installed:
-
-```bash
-PYTHONPATH=. python -m pytest tests/handlers/test_search_handler.py -q
-```
-
-These tests cover populated and empty branches, list size independent of graph size,
-filtered contents including duplicates, cube identity, operation isolation, and
-exported list continuity through post-processing in strict and non-strict modes. Additional plugin regression tests are maintained locally.
+These tests cover request/user isolation, concurrent Search API handlers, detached
+snapshots, removed counts, Add-history linking after restart, configuration,
+reservation recovery and application shutdown with pending writes. They use local
+temporary storage without running databases or model services.
 
 For an installed integration, follow the Quick start package and entry-point check, enable
 the plugin, and run a memory operation. Inspect the resulting JSON graph's `graph_id`,
 `data.nodes`, and `data.edges`, and check the service logs for writer failures or dropped
-events. Shutdown logs report accepted, processed, dropped, and failed event counts;
-queue acceptance alone does not confirm persistence.
+events. Shutdown logs report accepted, processed, dropped, failed and write-failure
+counts. `processed` advances after graph and metadata commit; `flush()` also waits
+for indexes. Queue acceptance alone does not confirm persistence, and a successful
+flush does not undo earlier dropped or failed events.
