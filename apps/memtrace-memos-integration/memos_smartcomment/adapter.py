@@ -10,6 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
+from memos_smartcomment.events import DeferredTraceEvent
 from memos_smartcomment.lineage import connect_search_lineage
 from memos_smartcomment.recorder import SmartCommentRecorder
 from memos_smartcomment.storage import TraceStore
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+_INDEX_FLUSH_SECONDS = 1.0
+_RETRY_SECONDS = 1.0
+_TraceKey = tuple[str | None, str]
 
 
 class Recorder(Protocol):
@@ -47,6 +51,8 @@ class AdapterStats:
     processed: int = 0
     failed: int = 0
     rejected: int = 0
+    # Retried persistence failures; unlike failed, these do not discard an event.
+    write_failures: int = 0
 
 
 @dataclass(slots=True)
@@ -70,8 +76,11 @@ class AsyncTraceAdapter:
         self._recorder_factory = recorder_factory or (
             lambda event: SmartCommentRecorder(settings, event)
         )
-        self._queue: queue.Queue[TraceEvent] = queue.Queue(maxsize=settings.queue_size)
-        self._recorders: OrderedDict[tuple[str | None, str], _CachedRecorder] = OrderedDict()
+        self._queue: queue.Queue[TraceEvent | DeferredTraceEvent] = queue.Queue(
+            maxsize=settings.queue_size
+        )
+        self._recorders: OrderedDict[_TraceKey, _CachedRecorder] = OrderedDict()
+        self._pending: dict[_TraceKey, list[TraceEvent]] = {}
         self._cached_graph_items = 0
         self._thread: threading.Thread | None = None
         self._started = False
@@ -79,6 +88,9 @@ class AsyncTraceAdapter:
         # Protect lifecycle state and stats; only the worker accesses the graph cache.
         self._state_lock = threading.Lock()
         self._stats = AdapterStats()
+        self._flush_requested = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
 
     # Request-facing lifecycle: bounded, non-blocking submission and explicit drain/close.
     @property
@@ -101,7 +113,7 @@ class AsyncTraceAdapter:
             if not self._started:
                 self._start_worker()
 
-    def submit(self, event: TraceEvent) -> bool:
+    def submit(self, event: TraceEvent | DeferredTraceEvent) -> bool:
         with self._state_lock:
             if self._closed:
                 self._stats.rejected += 1
@@ -113,26 +125,27 @@ class AsyncTraceAdapter:
                 self._stats.dropped += 1
             else:
                 self._stats.accepted += 1
+                self._idle.clear()
                 return True
         logger.warning("Dropping smartcomment event because the queue is full: %s", event.operation)
         return False
 
-    # A successful flush means tasks finished; stats.failed reports failed writes.
+    # Idle includes graph, metadata, and index publication, not only queue consumption.
     def flush(self, timeout: float = 5.0) -> bool:
-        deadline = time.monotonic() + timeout
-        with self._queue.all_tasks_done:
-            while self._queue.unfinished_tasks:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._queue.all_tasks_done.wait(remaining)
-        return True
+        with self._state_lock:
+            if self._idle.is_set():
+                return True
+            self._flush_requested.set()
+            if not self._started:
+                self._start_worker()
+        return self._idle.wait(timeout=max(0, timeout))
 
     # Drain accepted events; a timeout warns without interrupting an active write.
     def close(self, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
         with self._state_lock:
             self._closed = True
+            self._flush_requested.set()
             # Accepted events must drain even if start() was never called.
             if not self._started and not self._queue.empty():
                 self._start_worker()
@@ -184,17 +197,17 @@ class AsyncTraceAdapter:
             logger.exception("Failed to connect Add lineage for Search trace %s", event.trace_id)
 
     # Replace atomically so readers cannot observe a partial snapshot.
-    def _export(self, event: TraceEvent, recorder: Recorder) -> int:
+    def _export(self, events: list[TraceEvent], recorder: Recorder) -> int:
         exported = recorder.export_graph()
-        self._store.write(event, exported)
+        self._store.write(events, exported)
         data = exported.get("data", {})
         return sum(len(data.get(key, ())) for key in ("nodes", "edges", "operations", "sessions"))
 
-    # Worker-owned cache: keep only durable graphs and evict within configured limits.
-    # Evict the least recently used graph until all limits are satisfied.
-    def _trim_cache(self) -> None:
+    # Never evict uncommitted events, including when a checkpoint is being retried.
+    def _trim_cache(self) -> bool:
         now = time.monotonic()
         while self._recorders:
+            key = next(iter(self._recorders))
             oldest = next(iter(self._recorders.values()))
             if (
                 len(self._recorders) <= self.settings.max_cached_traces
@@ -202,51 +215,122 @@ class AsyncTraceAdapter:
                 and now - oldest.last_used < self.settings.cache_ttl_seconds
             ):
                 break
+            if key in self._pending and not self._commit_trace(key):
+                return False
             _, removed = self._recorders.popitem(last=False)
             self._cached_graph_items -= removed.graph_items
+        return True
 
-    def _process(self, event: TraceEvent) -> None:
+    def _get_recorder(self, event: TraceEvent) -> _CachedRecorder:
         key = (event.user_id, event.trace_id)
-        cached = self._recorders.pop(key, None)
+        cached = self._recorders.get(key)
         if cached is None:
             recorder = self._recorder_factory(event)
             snapshot = self._read_snapshot(event)
             if snapshot is not None:
                 recorder.restore_graph(snapshot)
-        else:
+            # A failed record may have partly mutated the graph. Replay only earlier
+            # successful observations, without losing their uncommitted changes.
+            for pending in self._pending.get(key, ()):
+                recorder.record(pending)
+            data = snapshot.get("data", {}) if snapshot is not None else {}
+            graph_items = sum(
+                len(data.get(field, ())) for field in ("nodes", "edges", "operations", "sessions")
+            )
+            cached = _CachedRecorder(recorder, time.monotonic(), graph_items)
+            self._recorders[key] = cached
+            self._cached_graph_items += graph_items
+        return cached
+
+    def _process(self, event: TraceEvent) -> None:
+        key = (event.user_id, event.trace_id)
+        cached = self._get_recorder(event)
+        try:
+            cached.recorder.record(event)
+            if self.settings.link_search_to_add and event.operation == "memos.search.rerank":
+                self._link_search_lineage(event, cached.recorder)
+        except Exception:
+            self._recorders.pop(key)
             self._cached_graph_items -= cached.graph_items
-            recorder = cached.recorder
-        # Cache only committed snapshots; failures reload the last durable graph.
-        recorder.record(event)
-        if self.settings.link_search_to_add and event.operation == "memos.search.rerank":
-            self._link_search_lineage(event, recorder)
-        graph_items = self._export(event, recorder)
-        self._recorders[key] = _CachedRecorder(recorder, time.monotonic(), graph_items)
-        self._cached_graph_items += graph_items
-        self._trim_cache()
+            raise
+        self._pending.setdefault(key, []).append(event)
+        cached.last_used = time.monotonic()
+        self._recorders.move_to_end(key)
+
+    def _commit_trace(self, key: _TraceKey) -> bool:
+        events = self._pending[key]
+        try:
+            cached = self._get_recorder(events[0])
+            graph_items = self._export(events, cached.recorder)
+        except Exception:
+            with self._state_lock:
+                self._stats.write_failures += 1
+            logger.exception("Failed to checkpoint smartcomment trace %s; retaining for retry", key)
+            return False
+        self._cached_graph_items += graph_items - cached.graph_items
+        cached.graph_items = graph_items
+        del self._pending[key]
+        with self._state_lock:
+            self._stats.processed += len(events)
+        for _event in events:
+            self._queue.task_done()
+        return True
+
+    def _flush_graphs(self) -> None:
+        # Stop consuming on I/O failure so the retry backlog cannot grow.
+        while self._pending:
+            for key in tuple(self._pending):
+                self._commit_trace(key)
+            if self._pending:
+                time.sleep(_RETRY_SECONDS)
+
+    def _flush_indexes(self) -> None:
+        while failures := self._store.publish_indexes():
+            with self._state_lock:
+                self._stats.write_failures += failures
+            time.sleep(_RETRY_SECONDS)
+
+    def _mark_idle(self) -> bool:
+        with self._state_lock:
+            if self._queue.empty() and not self._pending and not self._store.pending_indexes:
+                self._flush_requested.clear()
+                self._idle.set()
+                return self._closed
+        return False
 
     def _run(self) -> None:
+        next_index = time.monotonic() + _INDEX_FLUSH_SECONDS
         try:
             while True:
+                timeout = max(0, min(0.05, next_index - time.monotonic()))
                 try:
-                    event = self._queue.get(timeout=0.05)
+                    work = self._queue.get(timeout=timeout)
                 except queue.Empty:
-                    self._trim_cache()
-                    with self._state_lock:
-                        if self._closed and self._queue.empty():
-                            return
-                    continue
-                try:
-                    self._process(event)
-                except Exception:
-                    with self._state_lock:
-                        self._stats.failed += 1
-                    logger.exception("Failed to record smartcomment event: %s", event.operation)
+                    pass
                 else:
-                    with self._state_lock:
-                        self._stats.processed += 1
-                finally:
-                    self._queue.task_done()
+                    try:
+                        event = work.build() if isinstance(work, DeferredTraceEvent) else work
+                        self._process(event)
+                    except Exception:
+                        with self._state_lock:
+                            self._stats.failed += 1
+                        self._queue.task_done()
+                        logger.exception("Failed to record smartcomment event: %s", work.operation)
+                    else:
+                        # Break up CPU-heavy recording to prioritize API tail latency.
+                        self._flush_graphs()
+
+                now = time.monotonic()
+                force = self._flush_requested.is_set() and self._queue.empty()
+                if now >= next_index or force:
+                    self._flush_indexes()
+                    next_index = time.monotonic() + _INDEX_FLUSH_SECONDS
+                if not self._trim_cache():
+                    self._flush_graphs()
+                    self._trim_cache()
+                if self._mark_idle():
+                    return
         finally:
-            self._recorders.clear()
-            self._cached_graph_items = 0
+            if not self._pending:
+                self._recorders.clear()
+                self._cached_graph_items = 0

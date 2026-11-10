@@ -22,6 +22,8 @@ from memos.log import get_logger
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from memos_smartcomment.config import SmartCommentSettings
     from memos_smartcomment.events import TraceEvent
 
@@ -114,6 +116,7 @@ class TraceStore:
         self.project_id = settings.project_id
         self._lock = threading.RLock()
         self._catalogs: OrderedDict[Path, dict[str, dict[str, Any]]] = OrderedDict()
+        self._dirty_users: dict[Path, str | None] = {}
 
     def _user_directory(self, user_id: str | None, *, create: bool = False) -> Path | None:
         digest = _digest(user_id)
@@ -233,8 +236,9 @@ class TraceStore:
         _atomic_write(path / "meta.json", entry)
         return entry
 
-    def write(self, event: TraceEvent, graph: dict[str, Any]) -> None:
-        """Commit the graph atomically, then publish metadata and navigable indexes."""
+    def write(self, events: Sequence[TraceEvent], graph: dict[str, Any]) -> None:
+        """Commit one trace snapshot and all of its pending metadata; defer indexes."""
+        event = events[0]
         with self._lock:
             user = self._user_directory(event.user_id, create=True)
             entries = self._catalog(user, event.user_id)
@@ -244,16 +248,39 @@ class TraceStore:
             if entry["project_id"] != self.project_id:
                 raise MemOSError("Trace directory belongs to a different project")
             path = self._path(user, entry["path"])
-            entry["last_seen_at"] = max((entry["last_seen_at"], event.created_at), key=_timestamp)
-            entry["summary"] = entry["summary"] or _summary(event)
-            entry["session_id"] = entry["session_id"] or event.session_id
-            entry["task_id"] = entry["task_id"] or event.task_id
-            entry["cube_ids"] = sorted(set(entry["cube_ids"]) | set(event.cube_ids))
-            entry["operations"] = sorted(set(entry["operations"]) | {event.operation})
+            for observation in events:
+                entry["last_seen_at"] = max(
+                    (entry["last_seen_at"], observation.created_at), key=_timestamp
+                )
+                entry["summary"] = entry["summary"] or _summary(observation)
+                entry["session_id"] = entry["session_id"] or observation.session_id
+                entry["task_id"] = entry["task_id"] or observation.task_id
+                entry["cube_ids"] = sorted(set(entry["cube_ids"]) | set(observation.cube_ids))
+                entry["operations"] = sorted(set(entry["operations"]) | {observation.operation})
             _atomic_write(path, graph)
             _atomic_write(path.with_name("meta.json"), entry)
             entries[event.trace_id] = entry
-            self._publish(user, event.user_id, entries)
+            self._dirty_users[user] = event.user_id
+
+    @property
+    def pending_indexes(self) -> bool:
+        """Whether committed graphs still need index publication."""
+        with self._lock:
+            return bool(self._dirty_users)
+
+    def publish_indexes(self) -> int:
+        """Refresh each dirty user's indexes once; retain failures for retry."""
+        failed = 0
+        with self._lock:
+            for user, user_id in tuple(self._dirty_users.items()):
+                try:
+                    self._publish(user, user_id, self._catalog(user, user_id))
+                except Exception:
+                    failed += 1
+                    logger.exception("Failed to publish memtrace indexes: %s", user)
+                else:
+                    del self._dirty_users[user]
+        return failed
 
     def _publish(self, user: Path, user_id: str | None, entries: dict[str, dict[str, Any]]) -> None:
         committed = {

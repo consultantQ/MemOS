@@ -6,7 +6,7 @@
 
 ## 1. 公共模型与身份
 
-调用链为 `MemOS Hook → HookHandlers → TraceEvent → AsyncTraceAdapter → SmartCommentRecorder → JSON`。`HookHandlers` 组合 `AddHandler` 和 `SearchHandler`，两者也可以独立使用。
+调用链为 `MemOS Hook → HookHandlers → TraceEvent / DeferredTraceEvent → AsyncTraceAdapter → SmartCommentRecorder → JSON`。Search 结果阶段的 `DeferredTraceEvent` 在 writer 内构造为 `TraceEvent` 后直接写图，不再次入队。`HookHandlers` 组合 `AddHandler` 和 `SearchHandler`，两者也可以独立使用；未提供 `defer_search` 时保持同步事件交付。
 
 | 对象 | 表示什么 | 关键字段 |
 | --- | --- | --- |
@@ -389,7 +389,7 @@ session_metadata = {
 
 ## 6. 快照、导出与边界
 
-`_value()` 对 value 和 metadata、`_event()` 对事件 metadata，在 Hook 当前线程内执行快照；后台线程负责写图。dataclass 的 frozen 只禁止字段重新赋值，不深度冻结嵌套字典。
+`_value()` 对 value 和 metadata、`_event()` 对事件 metadata，在 Hook 当前线程内执行快照。Search 结果阶段只提取必要字段，逐字段截断和脱敏一次，复用已独立保存的列表作为节点值，不再先 deepcopy 再序列化整个条目。阶段关联和清理仍在请求线程完成；差异统计、分支及边的构造和写图在后台按入队顺序处理。事件时间和请求上下文在入队前固定，后台不读取业务原对象。长匹配键和结构化匿名正文用摘要保留截断前的匹配语义，不在队列中保留未脱敏的结构化正文。dataclass 的 frozen 只禁止字段重新赋值，不深度冻结嵌套字典。
 
 | 规则 | 当前行为 |
 | --- | --- |
@@ -407,7 +407,9 @@ session_metadata = {
 
 输出文件按 `(user_id, trace_id)` 隔离，路径为 `用户--短哈希/日期/入口类型/时间__trace前缀--短哈希/graph.json`。可读前缀保留 Unicode 字母、最多 32 字符，哈希初始 12 位，发生碰撞时延长；完整身份保存在 `_user.json` 和每张图的 `meta.json` 中。入口类型分为 `search/add/memread/other`，由首次记录事件决定。日期和时间默认使用运行 MemOS 服务的机器或容器当地时区（配置值 `local`），按事件发生日期应用夏令时规则；通过 `MEMOS_SMARTCOMMENT_OUTPUT_TIMEZONE` 可指定 `Asia/Shanghai`、`UTC` 等 IANA 时区覆盖默认值。目录和索引使用当地时间，事件原始 UTC 时间戳保持不变。
 
-同一 trace 首次写入后固定目录，跨天异步事件、缓存淘汰、重启和时区变更不改变路径；重用 trace 的多次请求仍进入同一张图。每个用户的 `index.md` 展示按请求时间倒序的类型、摘要、完整 trace ID 和图链接；`_index.json` 提供 trace 到元数据的映射。摘要来自已快照的 query/message，最多 160 字符加省略号，不调用模型。首次访问用户时读取 `meta.json` 重建内存索引，后续成功写入重新生成磁盘索引；元数据先预留路径，图原子写入后再发布索引，避免失败写入产生新的可点击链接。图、元数据、索引分别原子替换，不是跨文件事务。
+同一 trace 首次写入后固定目录，跨天异步事件、缓存淘汰、重启和时区变更不改变路径；重用 trace 的多次请求仍进入同一张图。每个用户的 `index.md` 展示按请求时间倒序的类型、摘要、完整 trace ID 和图链接；`_index.json` 提供 trace 到元数据的映射。摘要来自已快照的 query/message，最多 160 字符加省略号，不调用模型。首次访问用户时读取 `meta.json` 重建内存索引。writer 每处理一个事件就提交图及元数据，再消费下一个事件，以缩短同进程后台构图的连续 CPU 工作，优先降低 API p99；首个事件决定目录，后续事件逐次更新摘要、操作列表和关联字段。图提交后标记用户索引待刷新，每秒集中生成一次两个用户索引。缓存上限在每个事件提交后按导出大小检查。元数据先预留路径，图与元数据提交后才发布索引；图、元数据、索引分别原子替换，不是跨文件事务。
+
+`flush()` 成功表示队列、待写图和待发布索引均处理完成，仍需检查 `failed` 判断是否有事件构造失败。`processed` 在图和元数据提交后累加；可重试的持久化错误计入 `write_failures`，保留待写状态，每秒重试，期间暂停消费以限制内存积压。关闭超时只告警，worker 继续重试；持续存储故障时不能保证排空。队列积压和索引刷新会延迟可见性，进程崩溃可能丢失尚未提交的事件。启用 Search→Add 关联时，队列中此前处理的 Add 已提交，关联后立即提交当前 Search。
 
 `output_path()` 只查询已经分配的路径，未知 trace 抛出 `FileNotFoundError`。Search lineage 通过用户索引遍历所有日期、入口类型下的 `graph.json`，不把 `meta.json` 或 `_index.json` 当作图。旧的平铺 JSON 格式不读取、不迁移，也不删除。缓存淘汰不删除磁盘快照。配置和运行方式见 [应用 README](../README.md)。
 

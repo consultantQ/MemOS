@@ -39,6 +39,7 @@ class SmartCommentPlugin(MemOSPlugin):
         self.handlers = HookHandlers(
             self.adapter.submit,
             max_value_chars=settings.max_value_chars,
+            defer_search=self.adapter.submit,
         )
         # start the adapter, which will begin processing trace events asynchronously.
         self.adapter.start()
@@ -81,10 +82,12 @@ class SmartCommentPlugin(MemOSPlugin):
             stats = getattr(self.adapter, "stats", None)
             if stats is not None:
                 logger.info(
-                    "smartcomment plugin stopped; accepted=%d processed=%d dropped=%d failed=%d",
+                    "smartcomment plugin stopped; accepted=%d processed=%d dropped=%d "
+                    "failed=%d write_failures=%d",
                     stats.accepted,
                     stats.processed,
                     stats.dropped,
                     stats.failed,
+                    stats.write_failures,
                 )
         self.context = {"shared": {}, "configs": {}}

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 # Handlers detach nested values; frozen only prevents field reassignment.
@@ -56,3 +60,11 @@ class TraceEvent:
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     # Human-readable operation meaning; omitted comments use the recorder's default.
     comment: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredTraceEvent:
+    """Build an event on the writer using only detached, already-redacted captures."""
+
+    operation: str
+    build: Callable[[], TraceEvent]
